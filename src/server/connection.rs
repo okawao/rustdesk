@@ -1050,6 +1050,7 @@ impl Connection {
                 return false;
             }
         }
+        self.authorized = true;
         self.ip = addr.ip().to_string();
         let mut msg_out = Message::new();
         msg_out.set_hash(self.hash.clone());
