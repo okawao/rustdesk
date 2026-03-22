@@ -294,8 +294,9 @@ void runConnectionManagerScreen() async {
     MyTheme.currentThemeMode(),
   );
   final hide = await bind.cmGetConfig(name: "hide_cm") == 'true';
-  gFFI.serverModel.hideCm = hide;
-  if (hide) {
+  gFFI.serverModel.hideCmAuthorizedOnly = isWindows;
+  gFFI.serverModel.hideCm = hide && !gFFI.serverModel.hideCmAuthorizedOnly;
+  if (gFFI.serverModel.hideCm || gFFI.serverModel.hideCmAuthorizedOnly) {
     await hideCmWindow(isStartup: true);
   } else {
     await showCmWindow(isStartup: true);
