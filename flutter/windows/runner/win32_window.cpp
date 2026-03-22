@@ -160,7 +160,9 @@ Win32Window::~Win32Window() {
 
 bool Win32Window::CreateAndShow(const std::wstring& title,
                                 const Point& origin,
-                                const Size& size, bool showOnTaskBar) {
+                                const Size& size,
+                                bool showOnTaskBar,
+                                bool toolWindow) {
   Destroy();
 
   const wchar_t* window_class =
@@ -172,8 +174,11 @@ bool Win32Window::CreateAndShow(const std::wstring& title,
   UINT dpi = FlutterDesktopGetDpiForMonitor(monitor);
   double scale_factor = dpi / 96.0;
 
-  HWND window = CreateWindow(
-      window_class, title.c_str(), WS_OVERLAPPEDWINDOW,
+  auto style = WS_OVERLAPPEDWINDOW;
+  auto ex_style = toolWindow ? WS_EX_TOOLWINDOW : 0;
+  HWND window = CreateWindowEx(
+      ex_style,
+      window_class, title.c_str(), style,
       Scale(origin.x, scale_factor), Scale(origin.y, scale_factor),
       Scale(size.width, scale_factor), Scale(size.height, scale_factor),
       nullptr, nullptr, GetModuleHandle(nullptr), this);

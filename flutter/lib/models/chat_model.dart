@@ -353,6 +353,8 @@ class ChatModel with ChangeNotifier {
     if (text.isEmpty) return;
     if (desktopType == DesktopType.cm && !gFFI.serverModel.hideCmAuthorizedOnly) {
       await showCmWindow();
+    } else if (desktopType == DesktopType.cm) {
+      await windowManager.show();
     }
     String? peerId;
     if (id == clientModeID) {

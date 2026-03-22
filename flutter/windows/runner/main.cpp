@@ -151,7 +151,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
   } else {
     window_title = app_name;
   }
-  if (!window.CreateAndShow(window_title, origin, size, !is_cm_page)) {
+  if (!window.CreateAndShow(window_title, origin, size, !is_cm_page, is_cm_page)) {
       return EXIT_FAILURE;
   }
   window.SetQuitOnClose(true);

@@ -37,7 +37,8 @@ class Win32Window {
   bool CreateAndShow(const std::wstring& title,
                      const Point& origin,
                      const Size& size,
-                     bool showOnTaskBar = true);
+                     bool showOnTaskBar = true,
+                     bool toolWindow = false);
 
   // Release OS resources associated with window.
   void Destroy();
