@@ -44,6 +44,10 @@ env:
   #signing keys env variable checks
   ANDROID_SIGNING_KEY: "${{ secrets.ANDROID_SIGNING_KEY }}"
   MACOS_P12_BASE64: "${{ secrets.MACOS_P12_BASE64 }}"
+  # custom server settings for all client builds
+  RS_PUB_KEY: "${{ secrets.RS_PUB_KEY }}"
+  RENDEZVOUS_SERVER: "${{ secrets.RENDEZVOUS_SERVER }}"
+  API_SERVER: "${{ secrets.API_SERVER }}"
   UPLOAD_ARTIFACT: "${{ inputs.upload-artifact }}"
   SIGN_BASE_URL: "${{ secrets.SIGN_BASE_URL }}-2"
 
@@ -91,6 +95,59 @@ jobs:
         uses: actions/checkout@v4
         with:
           submodules: recursive
+
+      - name: Inject custom server settings
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${RENDEZVOUS_SERVER:-}" ] || [ -z "${RS_PUB_KEY:-}" ]; then
+            echo "RENDEZVOUS_SERVER and RS_PUB_KEY must be configured in GitHub Secrets."
+            exit 1
+          fi
+          echo "::add-mask::${RENDEZVOUS_SERVER}"
+          echo "::add-mask::${RS_PUB_KEY}"
+          if [ -n "${API_SERVER:-}" ]; then
+            echo "::add-mask::${API_SERVER}"
+          fi
+          python3 - <<'PY'
+          import os
+          import pathlib
+          import re
+
+          rendezvous = os.environ["RENDEZVOUS_SERVER"].strip()
+          pubkey = os.environ["RS_PUB_KEY"].strip()
+          api = os.environ.get("API_SERVER", "").strip()
+
+          config_path = pathlib.Path("libs/hbb_common/src/config.rs")
+          content = config_path.read_text(encoding="utf-8")
+          content_new = re.sub(
+              r'pub const RENDEZVOUS_SERVERS: &\[&str\] = &\[[^\]]*\];',
+              f'pub const RENDEZVOUS_SERVERS: &[&str] = &["{rendezvous}"];',
+              content,
+              count=1,
+          )
+          content_new = re.sub(
+              r'pub const RS_PUB_KEY: &str = ".*?";',
+              f'pub const RS_PUB_KEY: &str = "{pubkey}";',
+              content_new,
+              count=1,
+          )
+          if content_new == content:
+              raise SystemExit("Failed to inject RENDEZVOUS_SERVER/RS_PUB_KEY into config.rs")
+          config_path.write_text(content_new, encoding="utf-8")
+
+          if api:
+              common_path = pathlib.Path("src/common.rs")
+              common = common_path.read_text(encoding="utf-8")
+              common_new = common.replace(
+                  '"https://admin.rustdesk.com".to_owned()',
+                  f'"{api}".to_owned()',
+                  1,
+              )
+              if common_new == common:
+                  raise SystemExit("Failed to inject API_SERVER into src/common.rs")
+              common_path.write_text(common_new, encoding="utf-8")
+          PY
 
       - name: Restore bridge files
         uses: actions/download-artifact@master
@@ -312,6 +369,59 @@ jobs:
         uses: actions/checkout@v4
         with:
           submodules: recursive
+
+      - name: Inject custom server settings
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${RENDEZVOUS_SERVER:-}" ] || [ -z "${RS_PUB_KEY:-}" ]; then
+            echo "RENDEZVOUS_SERVER and RS_PUB_KEY must be configured in GitHub Secrets."
+            exit 1
+          fi
+          echo "::add-mask::${RENDEZVOUS_SERVER}"
+          echo "::add-mask::${RS_PUB_KEY}"
+          if [ -n "${API_SERVER:-}" ]; then
+            echo "::add-mask::${API_SERVER}"
+          fi
+          python3 - <<'PY'
+          import os
+          import pathlib
+          import re
+
+          rendezvous = os.environ["RENDEZVOUS_SERVER"].strip()
+          pubkey = os.environ["RS_PUB_KEY"].strip()
+          api = os.environ.get("API_SERVER", "").strip()
+
+          config_path = pathlib.Path("libs/hbb_common/src/config.rs")
+          content = config_path.read_text(encoding="utf-8")
+          content_new = re.sub(
+              r'pub const RENDEZVOUS_SERVERS: &\[&str\] = &\[[^\]]*\];',
+              f'pub const RENDEZVOUS_SERVERS: &[&str] = &["{rendezvous}"];',
+              content,
+              count=1,
+          )
+          content_new = re.sub(
+              r'pub const RS_PUB_KEY: &str = ".*?";',
+              f'pub const RS_PUB_KEY: &str = "{pubkey}";',
+              content_new,
+              count=1,
+          )
+          if content_new == content:
+              raise SystemExit("Failed to inject RENDEZVOUS_SERVER/RS_PUB_KEY into config.rs")
+          config_path.write_text(content_new, encoding="utf-8")
+
+          if api:
+              common_path = pathlib.Path("src/common.rs")
+              common = common_path.read_text(encoding="utf-8")
+              common_new = common.replace(
+                  '"https://admin.rustdesk.com".to_owned()',
+                  f'"{api}".to_owned()',
+                  1,
+              )
+              if common_new == common:
+                  raise SystemExit("Failed to inject API_SERVER into src/common.rs")
+              common_path.write_text(common_new, encoding="utf-8")
+          PY
 
       - name: Install LLVM and Clang
         uses: rustdesk-org/install-llvm-action-32bit@master
@@ -1338,6 +1448,59 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Inject custom server settings
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${RENDEZVOUS_SERVER:-}" ] || [ -z "${RS_PUB_KEY:-}" ]; then
+            echo "RENDEZVOUS_SERVER and RS_PUB_KEY must be configured in GitHub Secrets."
+            exit 1
+          fi
+          echo "::add-mask::${RENDEZVOUS_SERVER}"
+          echo "::add-mask::${RS_PUB_KEY}"
+          if [ -n "${API_SERVER:-}" ]; then
+            echo "::add-mask::${API_SERVER}"
+          fi
+          python3 - <<'PY'
+          import os
+          import pathlib
+          import re
+
+          rendezvous = os.environ["RENDEZVOUS_SERVER"].strip()
+          pubkey = os.environ["RS_PUB_KEY"].strip()
+          api = os.environ.get("API_SERVER", "").strip()
+
+          config_path = pathlib.Path("libs/hbb_common/src/config.rs")
+          content = config_path.read_text(encoding="utf-8")
+          content_new = re.sub(
+              r'pub const RENDEZVOUS_SERVERS: &\[&str\] = &\[[^\]]*\];',
+              f'pub const RENDEZVOUS_SERVERS: &[&str] = &["{rendezvous}"];',
+              content,
+              count=1,
+          )
+          content_new = re.sub(
+              r'pub const RS_PUB_KEY: &str = ".*?";',
+              f'pub const RS_PUB_KEY: &str = "{pubkey}";',
+              content_new,
+              count=1,
+          )
+          if content_new == content:
+              raise SystemExit("Failed to inject RENDEZVOUS_SERVER/RS_PUB_KEY into config.rs")
+          config_path.write_text(content_new, encoding="utf-8")
+
+          if api:
+              common_path = pathlib.Path("src/common.rs")
+              common = common_path.read_text(encoding="utf-8")
+              common_new = common.replace(
+                  '"https://admin.rustdesk.com".to_owned()',
+                  f'"{api}".to_owned()',
+                  1,
+              )
+              if common_new == common:
+                  raise SystemExit("Failed to inject API_SERVER into src/common.rs")
+              common_path.write_text(common_new, encoding="utf-8")
+          PY
+
       - name: Set Swap Space
         if: ${{ matrix.job.arch == 'x86_64' }}
         uses: pierotofy/set-swap-space@master
@@ -1667,6 +1830,59 @@ jobs:
         uses: actions/checkout@v4
         with:
           submodules: recursive
+
+      - name: Inject custom server settings
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${RENDEZVOUS_SERVER:-}" ] || [ -z "${RS_PUB_KEY:-}" ]; then
+            echo "RENDEZVOUS_SERVER and RS_PUB_KEY must be configured in GitHub Secrets."
+            exit 1
+          fi
+          echo "::add-mask::${RENDEZVOUS_SERVER}"
+          echo "::add-mask::${RS_PUB_KEY}"
+          if [ -n "${API_SERVER:-}" ]; then
+            echo "::add-mask::${API_SERVER}"
+          fi
+          python3 - <<'PY'
+          import os
+          import pathlib
+          import re
+
+          rendezvous = os.environ["RENDEZVOUS_SERVER"].strip()
+          pubkey = os.environ["RS_PUB_KEY"].strip()
+          api = os.environ.get("API_SERVER", "").strip()
+
+          config_path = pathlib.Path("libs/hbb_common/src/config.rs")
+          content = config_path.read_text(encoding="utf-8")
+          content_new = re.sub(
+              r'pub const RENDEZVOUS_SERVERS: &\[&str\] = &\[[^\]]*\];',
+              f'pub const RENDEZVOUS_SERVERS: &[&str] = &["{rendezvous}"];',
+              content,
+              count=1,
+          )
+          content_new = re.sub(
+              r'pub const RS_PUB_KEY: &str = ".*?";',
+              f'pub const RS_PUB_KEY: &str = "{pubkey}";',
+              content_new,
+              count=1,
+          )
+          if content_new == content:
+              raise SystemExit("Failed to inject RENDEZVOUS_SERVER/RS_PUB_KEY into config.rs")
+          config_path.write_text(content_new, encoding="utf-8")
+
+          if api:
+              common_path = pathlib.Path("src/common.rs")
+              common = common_path.read_text(encoding="utf-8")
+              common_new = common.replace(
+                  '"https://admin.rustdesk.com".to_owned()',
+                  f'"{api}".to_owned()',
+                  1,
+              )
+              if common_new == common:
+                  raise SystemExit("Failed to inject API_SERVER into src/common.rs")
+              common_path.write_text(common_new, encoding="utf-8")
+          PY
 
       - name: Modify vcpkg.json for armv7
         if: matrix.job.vcpkg-triplet == 'arm-linux'
