@@ -8,9 +8,21 @@ use std::sync::{Arc, Mutex};
 #[cfg(windows)]
 use std::time::Duration;
 
+#[inline]
+fn should_hide_tray_icon() -> bool {
+    #[cfg(windows)]
+    {
+        true
+    }
+    #[cfg(not(windows))]
+    {
+        crate::ui_interface::get_builtin_option(hbb_common::config::keys::OPTION_HIDE_TRAY) == "Y"
+    }
+}
+
 pub fn start_tray() {
-    if crate::ui_interface::get_builtin_option(hbb_common::config::keys::OPTION_HIDE_TRAY) == "Y" {
-        #[cfg(not(target_os = "macos"))]
+    if should_hide_tray_icon() {
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         {
             return;
         }
@@ -30,26 +42,33 @@ fn make_tray() -> hbb_common::ResultType<()> {
         menu::{Menu, MenuEvent, MenuItem},
         TrayIcon, TrayIconBuilder, TrayIconEvent as TrayEvent,
     };
-    let icon;
-    #[cfg(target_os = "macos")]
-    {
-        icon = include_bytes!("../res/mac-tray-dark-x2.png"); // use as template, so color is not important
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        icon = include_bytes!("../res/tray-icon.ico");
-    }
+    let hide_tray_icon = should_hide_tray_icon();
+    let icon = if hide_tray_icon {
+        None
+    } else {
+        let icon;
+        #[cfg(target_os = "macos")]
+        {
+            icon = include_bytes!("../res/mac-tray-dark-x2.png"); // use as template, so color is not important
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            icon = include_bytes!("../res/tray-icon.ico");
+        }
 
-    let (icon_rgba, icon_width, icon_height) = {
-        let image = load_icon_from_asset()
-            .unwrap_or(image::load_from_memory(icon).context("Failed to open icon path")?)
-            .into_rgba8();
-        let (width, height) = image.dimensions();
-        let rgba = image.into_raw();
-        (rgba, width, height)
+        let (icon_rgba, icon_width, icon_height) = {
+            let image = load_icon_from_asset()
+                .unwrap_or(image::load_from_memory(icon).context("Failed to open icon path")?)
+                .into_rgba8();
+            let (width, height) = image.dimensions();
+            let rgba = image.into_raw();
+            (rgba, width, height)
+        };
+        Some(
+            tray_icon::Icon::from_rgba(icon_rgba, icon_width, icon_height)
+                .context("Failed to open icon")?,
+        )
     };
-    let icon = tray_icon::Icon::from_rgba(icon_rgba, icon_width, icon_height)
-        .context("Failed to open icon")?;
 
     let mut event_loop = EventLoopBuilder::new().build();
 
@@ -136,11 +155,14 @@ fn make_tray() -> hbb_common::ResultType<()> {
         );
 
         if let tao::event::Event::NewEvents(tao::event::StartCause::Init) = event {
-            // for fixing https://github.com/rustdesk/rustdesk/discussions/10210#discussioncomment-14600745
-            // so we start tray, but not to show it
-            if crate::ui_interface::get_builtin_option(hbb_common::config::keys::OPTION_HIDE_TRAY) == "Y" {
+            // Keep the tray process running in hidden mode.
+            if hide_tray_icon {
                 return;
             }
+            let Some(icon) = icon.as_ref() else {
+                log::error!("Failed to load tray icon");
+                return;
+            };
             // We create the icon once the event loop is actually running
             // to prevent issues like https://github.com/tauri-apps/tray-icon/issues/90
             let tray = TrayIconBuilder::new()
