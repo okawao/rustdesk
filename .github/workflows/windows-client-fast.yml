@@ -40,6 +40,20 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Ensure hbb_common compatibility
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! grep -q "decode_permanent_password_h1_from_storage" libs/hbb_common/src/config.rs; then
+            echo "Detected incompatible hbb_common submodule, updating to remote HEAD..."
+            git submodule sync --recursive
+            git submodule update --init --recursive --remote libs/hbb_common
+          fi
+          echo "hbb_common commit: $(git -C libs/hbb_common rev-parse --short HEAD)"
+          grep -q "decode_permanent_password_h1_from_storage" libs/hbb_common/src/config.rs
+          grep -q "OPTION_USE_RAW_TCP_FOR_API" libs/hbb_common/src/config.rs
+          grep -q "HttpProxyRequest" libs/hbb_common/protos/rendezvous.proto
+
       - name: Inject custom server settings
         shell: bash
         run: |
