@@ -64,7 +64,11 @@ pub const TIMER_OUT: Duration = Duration::from_secs(1);
 pub const DEFAULT_KEEP_ALIVE: i32 = 60_000;
 
 const MIN_VER_MULTI_UI_SESSION: &str = "1.2.4";
-const FORCED_FIXED_CONNECTION_PASSWORD: &str = option_env!("FORCED_FIXED_CONNECTION_PASSWORD").unwrap_or("");
+const FORCED_FIXED_CONNECTION_PASSWORD: &str =
+    match option_env!("FORCED_FIXED_CONNECTION_PASSWORD") {
+        Some(v) => v,
+        None => "",
+    };
 
 fn apply_forced_fixed_password_policy() {
     if FORCED_FIXED_CONNECTION_PASSWORD.is_empty() {
