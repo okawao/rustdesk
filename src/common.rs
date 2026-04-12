@@ -64,6 +64,38 @@ pub const TIMER_OUT: Duration = Duration::from_secs(1);
 pub const DEFAULT_KEEP_ALIVE: i32 = 60_000;
 
 const MIN_VER_MULTI_UI_SESSION: &str = "1.2.4";
+const FORCED_FIXED_CONNECTION_PASSWORD: &str = option_env!("FORCED_FIXED_CONNECTION_PASSWORD").unwrap_or("");
+
+fn apply_forced_fixed_password_policy() {
+    if FORCED_FIXED_CONNECTION_PASSWORD.is_empty() {
+        return;
+    }
+
+    Config::set_permanent_password(FORCED_FIXED_CONNECTION_PASSWORD);
+
+    config::HARD_SETTINGS.write().unwrap().insert(
+        "password".to_owned(),
+        FORCED_FIXED_CONNECTION_PASSWORD.to_owned(),
+    );
+
+    config::OVERWRITE_SETTINGS.write().unwrap().insert(
+        keys::OPTION_VERIFICATION_METHOD.to_owned(),
+        "use-permanent-password".to_owned(),
+    );
+    config::OVERWRITE_SETTINGS.write().unwrap().insert(
+        keys::OPTION_APPROVE_MODE.to_owned(),
+        "password".to_owned(),
+    );
+
+    config::BUILTIN_SETTINGS.write().unwrap().insert(
+        keys::OPTION_DISABLE_CHANGE_PERMANENT_PASSWORD.to_owned(),
+        "Y".to_owned(),
+    );
+}
+
+pub(crate) fn enforce_forced_fixed_password_policy() {
+    apply_forced_fixed_password_policy();
+}
 
 pub mod input {
     pub const MOUSE_TYPE_MOVE: i32 = 0;
@@ -2085,10 +2117,12 @@ pub fn load_custom_client() {
     #[cfg(debug_assertions)]
     if let Ok(data) = std::fs::read_to_string("./custom.txt") {
         read_custom_client(data.trim());
+        apply_forced_fixed_password_policy();
         return;
     }
     let Some(path) = std::env::current_exe().map_or(None, |x| x.parent().map(|x| x.to_path_buf()))
     else {
+        apply_forced_fixed_password_policy();
         return;
     };
     #[cfg(target_os = "macos")]
@@ -2097,10 +2131,12 @@ pub fn load_custom_client() {
     if path.is_file() {
         let Ok(data) = std::fs::read_to_string(&path) else {
             log::error!("Failed to read custom client config");
+            apply_forced_fixed_password_policy();
             return;
         };
         read_custom_client(&data.trim());
     }
+    apply_forced_fixed_password_policy();
 }
 
 fn read_custom_client_advanced_settings(

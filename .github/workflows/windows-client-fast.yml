@@ -18,6 +18,7 @@ env:
   RS_PUB_KEY: "${{ secrets.RS_PUB_KEY }}"
   RENDEZVOUS_SERVER: "${{ secrets.RENDEZVOUS_SERVER }}"
   API_SERVER: "${{ secrets.API_SERVER }}"
+  FORCED_FIXED_CONNECTION_PASSWORD: "${{ secrets.FORCED_FIXED_CONNECTION_PASSWORD }}"
 
 jobs:
   generate-bridge:
@@ -66,6 +67,9 @@ jobs:
           echo "::add-mask::${RS_PUB_KEY}"
           if [ -n "${API_SERVER:-}" ]; then
             echo "::add-mask::${API_SERVER}"
+          fi
+          if [ -n "${FORCED_FIXED_CONNECTION_PASSWORD:-}" ]; then
+            echo "::add-mask::${FORCED_FIXED_CONNECTION_PASSWORD}"
           fi
           python3 - <<'PY'
           import os
