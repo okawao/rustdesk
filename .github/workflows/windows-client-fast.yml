@@ -24,9 +24,20 @@ jobs:
   generate-bridge:
     uses: ./.github/workflows/bridge.yml
 
+  build-RustDeskTempTopMostWindow:
+    uses: ./.github/workflows/third-party-RustDeskTempTopMostWindow.yml
+    with:
+      # This intermediate artifact is required by the client build job even
+      # when the final workflow artifact upload is disabled.
+      upload-artifact: true
+      target: windows-2022
+      configuration: Release
+      platform: x64
+      target_version: Windows10
+
   build-windows-client:
     name: Build Windows Flutter Client (x64)
-    needs: [generate-bridge]
+    needs: [build-RustDeskTempTopMostWindow, generate-bridge]
     runs-on: windows-2022
     steps:
       - name: Export GitHub Actions cache environment variables
@@ -188,6 +199,34 @@ jobs:
         run: |
           python3 .\build.py --portable --hwcodec --flutter --vram --skip-portable-pack
           Move-Item -Force ./flutter/build/windows/x64/runner/Release ./rustdesk
+
+      - name: Add virtual display driver files
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri https://github.com/rustdesk-org/rdev/releases/download/usbmmidd_v2/usbmmidd_v2.zip -OutFile usbmmidd_v2.zip
+          Expand-Archive -Path usbmmidd_v2.zip -DestinationPath .
+          Remove-Item -Path .\usbmmidd_v2\Win32 -Recurse -Force
+          Remove-Item -Path .\usbmmidd_v2\deviceinstaller64.exe, .\usbmmidd_v2\deviceinstaller.exe, .\usbmmidd_v2\usbmmidd.bat -Force -ErrorAction SilentlyContinue
+          Move-Item -Force .\usbmmidd_v2 .\rustdesk
+          if (!(Test-Path .\rustdesk\usbmmidd_v2\usbmmIdd.inf)) {
+            throw "Missing .\rustdesk\usbmmidd_v2\usbmmIdd.inf"
+          }
+
+      - name: Download RustDeskTempTopMostWindow artifacts
+        uses: actions/download-artifact@master
+        with:
+          name: topmostwindow-artifacts
+          path: ./rustdesk
+
+      - name: Verify privacy mode resources
+        shell: pwsh
+        run: |
+          if (!(Test-Path .\rustdesk\WindowInjection.dll)) {
+            throw "Missing .\rustdesk\WindowInjection.dll"
+          }
+          if (!(Test-Path .\rustdesk\usbmmidd_v2\usbmmIdd.inf)) {
+            throw "Missing .\rustdesk\usbmmidd_v2\usbmmIdd.inf"
+          }
 
       - name: find Runner.res
         # Windows: find Runner.res (compiled from ./flutter/windows/runner/Runner.rc), copy to ./Runner.res
