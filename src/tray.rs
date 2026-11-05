@@ -4,6 +4,7 @@ use crate::ipc::Data;
 #[cfg(windows)]
 use hbb_common::tokio;
 use hbb_common::{allow_err, log};
+use base::config::keys;
 use std::sync::{Arc, Mutex};
 #[cfg(windows)]
 use std::time::Duration;
@@ -16,7 +17,7 @@ fn should_hide_tray_icon() -> bool {
     }
     #[cfg(not(windows))]
     {
-        crate::ui_interface::get_builtin_option(hbb_common::config::keys::OPTION_HIDE_TRAY) == "Y"
+        crate::ui_interface::get_builtin_option(keys::OPTION_HIDE_TRAY) == "Y"
     }
 }
 
@@ -42,6 +43,15 @@ fn make_tray() -> hbb_common::ResultType<()> {
         menu::{Menu, MenuEvent, MenuItem},
         TrayIcon, TrayIconBuilder, TrayIconEvent as TrayEvent,
     };
+
+    // Duplicated tray icons kept piling up through the blind spots of
+    // `check_process("--tray", ..)`. https://github.com/rustdesk/rustdesk/issues/15689
+    #[cfg(windows)]
+    if !crate::platform::windows::try_lock_tray_single_instance() {
+        log::info!("Another tray process is already running in this session, exit");
+        return Ok(());
+    }
+
     let hide_tray_icon = should_hide_tray_icon();
     let icon = if hide_tray_icon {
         None
@@ -74,7 +84,7 @@ fn make_tray() -> hbb_common::ResultType<()> {
 
     let tray_menu = Menu::new();
     let hide_stop_service = crate::ui_interface::get_builtin_option(
-        hbb_common::config::keys::OPTION_HIDE_STOP_SERVICE,
+        keys::OPTION_HIDE_STOP_SERVICE,
     ) == "Y";
     // The tray icon is only shown when the service is running, so we don't need to check
     // the `stop-service` option here.
@@ -165,12 +175,22 @@ fn make_tray() -> hbb_common::ResultType<()> {
             };
             // We create the icon once the event loop is actually running
             // to prevent issues like https://github.com/tauri-apps/tray-icon/issues/90
-            let tray = TrayIconBuilder::new()
+            let mut builder = TrayIconBuilder::new()
+                .with_id(crate::get_app_name().to_lowercase())
                 .with_menu(Box::new(tray_menu.clone()))
                 .with_tooltip(tooltip(0))
-                .with_icon(icon.clone())
-                .with_icon_as_template(true) // mac only
-                .build();
+                .with_icon(icon.clone());
+            #[cfg(target_os = "macos")]
+            {
+                builder = builder.with_icon_as_template(true);
+            }
+            #[cfg(target_os = "windows")]
+            {
+                // Required since tray-icon 0.17
+                // Fixes #15215, #15222, #15410
+                builder = builder.with_menu_on_left_click(false);
+            }
+            let tray = builder.build();
             match tray {
                 Ok(tray) => _tray_icon = Arc::new(Mutex::new(Some(tray))),
                 Err(err) => {
@@ -198,9 +218,26 @@ fn make_tray() -> hbb_common::ResultType<()> {
                         return;
                     }
                     */
+                    // Remove the icon first: on success `uninstall_service()` ends
+                    // this process with `std::process::exit`, which skips the
+                    // destructor that would remove it, leaving a ghost icon behind.
+                    #[cfg(windows)]
+                    let _ = _tray_icon
+                        .lock()
+                        .unwrap()
+                        .as_mut()
+                        .map(|t| t.set_visible(false));
                     if !crate::platform::uninstall_service(false, false) {
                         *control_flow = ControlFlow::Exit;
                     }
+                    // Still alive, so stopping the service failed or was cancelled
+                    // in the UAC prompt. Show the icon again.
+                    #[cfg(windows)]
+                    let _ = _tray_icon
+                        .lock()
+                        .unwrap()
+                        .as_mut()
+                        .map(|t| t.set_visible(true));
                 } else if event.id == open_i.id() {
                     open_func();
                 }

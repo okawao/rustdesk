@@ -17,7 +17,7 @@ env:
   FLUTTER_VERSION: "3.24.5"
   VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
   # Keep this in sync with flutter-build.yml
-  VCPKG_COMMIT_ID: "120deac3062162151622ca4860575a33844ba10b"
+  VCPKG_COMMIT_ID: "9e593bb18ea69cc5095e012465dcd675a822ed0d"
   RS_PUB_KEY: "${{ secrets.RS_PUB_KEY }}"
   RENDEZVOUS_SERVER: "${{ secrets.RENDEZVOUS_SERVER }}"
   API_SERVER: "${{ secrets.API_SERVER }}"
@@ -44,7 +44,7 @@ jobs:
     runs-on: windows-2022
     steps:
       - name: Export GitHub Actions cache environment variables
-        uses: actions/github-script@v6
+        uses: actions/github-script@v8
         with:
           script: |
             core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
@@ -59,15 +59,24 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if ! grep -q "decode_permanent_password_h1_from_storage" libs/hbb_common/src/config.rs; then
-            echo "Detected incompatible hbb_common submodule, updating to remote HEAD..."
-            git submodule sync --recursive
-            git submodule update --init --recursive --remote libs/hbb_common
+          expected=$(git ls-tree HEAD libs/hbb_common | awk '{print $3}')
+          actual=$(git -C libs/hbb_common rev-parse HEAD)
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::hbb_common must match the pinned commit $expected; found $actual"
+            exit 1
           fi
-          echo "hbb_common commit: $(git -C libs/hbb_common rev-parse --short HEAD)"
-          grep -q "decode_permanent_password_h1_from_storage" libs/hbb_common/src/config.rs
-          grep -q "OPTION_USE_RAW_TCP_FOR_API" libs/hbb_common/src/config.rs
-          grep -q "HttpProxyRequest" libs/hbb_common/protos/rendezvous.proto
+          for entry in \
+            'libs/hbb_common/src/config.rs:decode_permanent_password_h1_from_storage' \
+            'libs/base/src/config/keys.rs:OPTION_USE_RAW_TCP_FOR_API' \
+            'libs/hbb_common/protos/rendezvous.proto:HttpProxyRequest'; do
+            file=${entry%%:*}
+            symbol=${entry#*:}
+            if ! grep -Fq "$symbol" "$file"; then
+              echo "::error::Missing required symbol $symbol in $file"
+              exit 1
+            fi
+          done
+          echo "hbb_common commit: $actual"
 
       - name: Inject custom server settings
         shell: bash
@@ -287,7 +296,7 @@ jobs:
           swap-storage: false
 
       - name: Export GitHub Actions cache environment variables
-        uses: actions/github-script@v6
+        uses: actions/github-script@v8
         with:
           script: |
             core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
@@ -302,15 +311,24 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if ! grep -q "decode_permanent_password_h1_from_storage" libs/hbb_common/src/config.rs; then
-            echo "Detected incompatible hbb_common submodule, updating to remote HEAD..."
-            git submodule sync --recursive
-            git submodule update --init --recursive --remote libs/hbb_common
+          expected=$(git ls-tree HEAD libs/hbb_common | awk '{print $3}')
+          actual=$(git -C libs/hbb_common rev-parse HEAD)
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::hbb_common must match the pinned commit $expected; found $actual"
+            exit 1
           fi
-          echo "hbb_common commit: $(git -C libs/hbb_common rev-parse --short HEAD)"
-          grep -q "decode_permanent_password_h1_from_storage" libs/hbb_common/src/config.rs
-          grep -q "OPTION_USE_RAW_TCP_FOR_API" libs/hbb_common/src/config.rs
-          grep -q "HttpProxyRequest" libs/hbb_common/protos/rendezvous.proto
+          for entry in \
+            'libs/hbb_common/src/config.rs:decode_permanent_password_h1_from_storage' \
+            'libs/base/src/config/keys.rs:OPTION_USE_RAW_TCP_FOR_API' \
+            'libs/hbb_common/protos/rendezvous.proto:HttpProxyRequest'; do
+            file=${entry%%:*}
+            symbol=${entry#*:}
+            if ! grep -Fq "$symbol" "$file"; then
+              echo "::error::Missing required symbol $symbol in $file"
+              exit 1
+            fi
+          done
+          echo "hbb_common commit: $actual"
 
       - name: Inject custom server settings
         shell: bash
@@ -484,7 +502,7 @@ jobs:
           swap-storage: false
 
       - name: Export GitHub Actions cache environment variables
-        uses: actions/github-script@v6
+        uses: actions/github-script@v8
         with:
           script: |
             core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
@@ -499,15 +517,24 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if ! grep -q "decode_permanent_password_h1_from_storage" libs/hbb_common/src/config.rs; then
-            echo "Detected incompatible hbb_common submodule, updating to remote HEAD..."
-            git submodule sync --recursive
-            git submodule update --init --recursive --remote libs/hbb_common
+          expected=$(git ls-tree HEAD libs/hbb_common | awk '{print $3}')
+          actual=$(git -C libs/hbb_common rev-parse HEAD)
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::hbb_common must match the pinned commit $expected; found $actual"
+            exit 1
           fi
-          echo "hbb_common commit: $(git -C libs/hbb_common rev-parse --short HEAD)"
-          grep -q "decode_permanent_password_h1_from_storage" libs/hbb_common/src/config.rs
-          grep -q "OPTION_USE_RAW_TCP_FOR_API" libs/hbb_common/src/config.rs
-          grep -q "HttpProxyRequest" libs/hbb_common/protos/rendezvous.proto
+          for entry in \
+            'libs/hbb_common/src/config.rs:decode_permanent_password_h1_from_storage' \
+            'libs/base/src/config/keys.rs:OPTION_USE_RAW_TCP_FOR_API' \
+            'libs/hbb_common/protos/rendezvous.proto:HttpProxyRequest'; do
+            file=${entry%%:*}
+            symbol=${entry#*:}
+            if ! grep -Fq "$symbol" "$file"; then
+              echo "::error::Missing required symbol $symbol in $file"
+              exit 1
+            fi
+          done
+          echo "hbb_common commit: $actual"
 
       - name: Inject custom server settings
         shell: bash
