@@ -2950,6 +2950,119 @@ fn punch_tid(packet: &[u8], tag: &[u8; 4]) -> Option<u64> {
     packet[4..].try_into().ok().map(u64::from_le_bytes)
 }
 
+// A verified punch. The probe keeps the plain 12-byte shape and only marks its transaction id, so
+// a peer from before this check reads it as an ordinary probe and echoes it: nothing old is ever
+// handed a shape it does not know, and nothing old reaches KCP with it. The answer that proves an
+// identity is a separate datagram, which such a peer never receives because it never asks.
+const PUNCH_AUTH_MAGIC: u32 = 0x9E37_79B9;
+const PUNCH_PROOF: [u8; 4] = *b"RDP#";
+const PUNCH_AUTH_DOMAIN: &[u8] = b"rustdesk-punch-proof-v1";
+const PUNCH_PROOF_HEAD_LEN: usize = 4 + 8;
+
+fn punch_auth_tid() -> u64 {
+    ((PUNCH_AUTH_MAGIC as u64) << 32) | (hbb_common::time_based_rand() as u64 & 0xFFFF_FFFF)
+}
+
+fn is_punch_auth_tid(tid: u64) -> bool {
+    (tid >> 32) as u32 == PUNCH_AUTH_MAGIC
+}
+
+fn punch_auth_payload(tid: u64) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(PUNCH_AUTH_DOMAIN.len() + 8);
+    payload.extend_from_slice(PUNCH_AUTH_DOMAIN);
+    payload.extend_from_slice(&tid.to_le_bytes());
+    payload
+}
+
+/// The transaction id of a proof datagram, if this is one.
+fn punch_proof_tid(packet: &[u8]) -> Option<u64> {
+    if packet.len() <= PUNCH_PROOF_HEAD_LEN || !packet.starts_with(&PUNCH_PROOF) {
+        return None;
+    }
+    packet[4..PUNCH_PROOF_HEAD_LEN]
+        .try_into()
+        .ok()
+        .map(u64::from_le_bytes)
+}
+
+fn punch_proof_packet(tid: u64, sk: &sign::SecretKey) -> Bytes {
+    let signed: Bytes = sign::sign(&punch_auth_payload(tid), sk).into();
+    let mut packet = Vec::with_capacity(PUNCH_PROOF_HEAD_LEN + signed.len());
+    packet.extend_from_slice(&PUNCH_PROOF);
+    packet.extend_from_slice(&tid.to_le_bytes());
+    packet.extend_from_slice(&signed);
+    packet.into()
+}
+
+/// Whether a proof datagram answers `tid` and comes from the holder of `pk`.
+fn punch_proof_matches(packet: &[u8], tid: u64, pk: &sign::PublicKey) -> bool {
+    if packet.len() <= PUNCH_PROOF_HEAD_LEN || !packet.starts_with(&PUNCH_PROOF) {
+        return false;
+    }
+    if packet[4..PUNCH_PROOF_HEAD_LEN] != tid.to_le_bytes()[..] {
+        return false;
+    }
+    match sign::verify(&packet[PUNCH_PROOF_HEAD_LEN..], pk) {
+        // `verify` returns the message that was signed; the prefix test accepts it whether or not
+        // this sodiumoxide build also hands back the signature.
+        Ok(message) => message.starts_with(&punch_auth_payload(tid)),
+        Err(_) => false,
+    }
+}
+
+/// Sign `tid` with this machine's identity key, or `None` when it has none (a key-less build).
+fn own_punch_proof(tid: u64) -> Option<Bytes> {
+    let (sk, pk) = Config::get_key_pair();
+    if sk.len() != sign::SECRETKEYBYTES || pk.len() != sign::PUBLICKEYBYTES {
+        return None;
+    }
+    let mut sk_b = [0u8; sign::SECRETKEYBYTES];
+    sk_b.copy_from_slice(&sk);
+    Some(punch_proof_packet(tid, &sign::SecretKey(sk_b)))
+}
+
+/// The identity key the rendezvous server vouched for `peer`, for checking the proof it sends on a
+/// punch. `None` when there is none to check against, which is the case a punch has always had.
+pub fn punch_verify_key(signed_id_pk: &[u8], licence_key: &str) -> Option<sign::PublicKey> {
+    let rs_pk = get_rs_pk(if licence_key.is_empty() {
+        config::RS_PUB_KEY
+    } else {
+        licence_key
+    })?;
+    decode_id_pk(signed_id_pk, &rs_pk)
+        .ok()
+        .map(|(_, pk)| sign::PublicKey(pk))
+}
+
+/// The addresses this punch socket can be reached on besides the one the server observes, for the
+/// peer to try when that one is the wrong mapping. `AddrMangle`-encoded.
+#[cfg(not(target_os = "ios"))]
+pub fn punch_local_candidates(port: u16) -> Vec<Bytes> {
+    let mut candidates = Vec::new();
+    for interface in default_net::get_interfaces() {
+        for ipv4 in &interface.ipv4 {
+            if ipv4.addr.is_unspecified() || ipv4.addr.is_loopback() {
+                continue;
+            }
+            candidates.push(
+                hbb_common::AddrMangle::encode(SocketAddr::from((ipv4.addr, port))).into(),
+            );
+            if candidates.len() >= MAX_PUNCH_CANDIDATES {
+                return candidates;
+            }
+        }
+    }
+    candidates
+}
+
+#[cfg(target_os = "ios")]
+pub fn punch_local_candidates(_port: u16) -> Vec<Bytes> {
+    Vec::new()
+}
+
+/// Bound on the extra addresses a punch announces or tries: each one costs the peer a probe.
+pub const MAX_PUNCH_CANDIDATES: usize = 8;
+
 /// Punch until one of our own probes is acknowledged. Both ends run this identically - each
 /// probes, each answers the other's probes - and each returns only once a reply carrying its own
 /// transaction id comes back, the one thing that proves the pair carries traffic both ways.
@@ -2966,12 +3079,57 @@ fn punch_tid(packet: &[u8], tag: &[u8; 4]) -> Option<u64> {
 /// shorter than its header. A listener that stopped here would go mute while a peer whose own
 /// probe or answer was lost - the normal state of a hole that is still opening - kept probing an
 /// endpoint that works, until it timed out. So the listener stops on the peer's first real packet.
+///
+/// This is `punch_udp_inner` with no identity to check the peer against: the shape the punch has
+/// always had. A caller that has one uses `punch_udp_verified` instead.
 pub async fn punch_udp(
     socket: Arc<UdpSocket>,
     listen: bool,
 ) -> ResultType<Option<bytes::BytesMut>> {
+    punch_udp_inner(socket, listen, None).await
+}
+
+/// The connector's half of a verified punch: a round trip that is proven, and - when the caller
+/// knows the identity key the rendezvous server vouched for the peer - proof that the host at the
+/// dialled address holds that key.
+///
+/// An address that is wrong usually still answers: a public address shared with another host, a
+/// port that now belongs to something else, a NAT that maps to a neighbour. Without the proof the
+/// only way to find out is to spend a transport handshake on it and wait for it to time out. The
+/// proof rejects it in one round trip, which is what makes trying a second address affordable.
+///
+/// `verify` being `None` makes this exactly `punch_udp` with `listen = false`.
+pub async fn punch_udp_verified(
+    socket: Arc<UdpSocket>,
+    verify: Option<sign::PublicKey>,
+) -> ResultType<()> {
+    punch_udp_inner(socket, false, verify.as_ref())
+        .await
+        .map(|_| ())
+}
+
+async fn punch_udp_inner(
+    socket: Arc<UdpSocket>,
+    listen: bool,
+    verify: Option<&sign::PublicKey>,
+) -> ResultType<Option<bytes::BytesMut>> {
     let tid = ((hbb_common::time_based_rand() as u64) << 32) | hbb_common::time_based_rand() as u64;
     let probe = punch_packet(&PUNCH_PROBE, tid);
+    // The marked probe rides out with the plain one, so its answer comes back on a round trip the
+    // punch was spending anyway instead of on one of its own.
+    let auth_tid = verify.map(|_| punch_auth_tid());
+    let auth_probe = auth_tid.map(|t| punch_packet(&PUNCH_PROBE, t));
+    let mut proved = false;
+    // Set when the peer echoed the marked probe unsigned, which is what a build from before the
+    // proof does - there is nothing further to wait for.
+    let mut predates_proof = false;
+    // A peer picks the nonce, so at most one signature is made per punch.
+    let mut cached_proof: Option<Bytes> = None;
+    // Idle until our own probe comes back; then one peer round trip for the proof to follow. A
+    // deadline set to never fire is how `select!` is kept to a fixed set of arms.
+    const PROOF_GRACE: Duration = Duration::from_millis(150);
+    const PROOF_IDLE: Duration = Duration::from_secs(3600);
+    let mut proof_deadline = Instant::now() + PROOF_IDLE;
     let mut data = [0u8; 1500];
     // `connect` does not flush the receive queue, so the NAT test's extra replies are still in it.
     while socket.try_recv(&mut data).is_ok() {}
@@ -2987,6 +3145,9 @@ pub async fn punch_udp(
     let mut acked = false;
     let mut recv_errors = 0u32;
     socket.send(&probe).await.ok();
+    if let Some(p) = auth_probe.as_ref() {
+        socket.send(p).await.ok();
+    }
     probes_sent += 1;
     let tm = Instant::now();
     // Absolute instants, not relative sleeps: `select!` rebuilds every arm each iteration, so a
@@ -2999,10 +3160,31 @@ pub async fn punch_udp(
     loop {
         tokio::select! {
             _ = tokio::time::sleep_until(deadline) => {
+                if acked && !listen {
+                    // The round trip is proven and only the proof is missing: report what we have
+                    // rather than fail a hole that already carries traffic. A listener keeps the
+                    // shape it has always had and gives up here.
+                    log::debug!("UDP punch confirmed without an identity proof");
+                    return Ok(None);
+                }
                 bail!("UDP punch is timed out, {probes_sent} probes sent, {probes_seen} probes received, acked: {acked}, {recv_errors} recv errors absorbed");
+            }
+            _ = tokio::time::sleep_until(proof_deadline) => {
+                if acked && !listen {
+                    // One peer round trip after the acknowledgement is the whole budget a proof
+                    // that travels the same path needs to have crossed.
+                    if !proved {
+                        log::debug!("UDP punch confirmed without an identity proof");
+                    }
+                    return Ok(None);
+                }
+                proof_deadline = Instant::now() + PROOF_IDLE;
             }
             _ = tokio::time::sleep_until(next_probe) => {
                 socket.send(&probe).await.ok();
+                if let Some(p) = auth_probe.as_ref() {
+                    socket.send(p).await.ok();
+                }
                 probes_sent += 1;
                 retry_interval = std::cmp::min(retry_interval.mul_f64(1.5), MAX_INTERVAL);
                 next_probe = Instant::now() + retry_interval;
@@ -3019,20 +3201,63 @@ pub async fn punch_udp(
                     hbb_common::sleep(0.01).await;
                 }
                 Ok(n) => {
-                    let ack = punch_tid(&data[..n], &PUNCH_ACK);
-                    if ack == Some(tid) {
-                        if !listen {
-                            log::debug!(
-                                "UDP punch confirmed in {:?}, {probes_sent} probes sent, {probes_seen} received",
-                                tm.elapsed()
-                            );
-                            return Ok(None);
+                    if let Some(t) = punch_tid(&data[..n], &PUNCH_ACK) {
+                        if t == tid {
+                            if !listen && (verify.is_none() || proved || predates_proof) {
+                                log::debug!(
+                                    "UDP punch confirmed in {:?}, {probes_sent} probes sent, {probes_seen} received, proved: {proved}",
+                                    tm.elapsed()
+                                );
+                                return Ok(None);
+                            }
+                            acked = true;
+                            proof_deadline = Instant::now() + PROOF_GRACE;
+                        } else if Some(t) == auth_tid {
+                            // The peer echoed the marked probe unsigned, so it predates the proof
+                            // and there is nothing left to wait for once the round trip is proven.
+                            predates_proof = true;
+                            if acked && !listen {
+                                log::debug!(
+                                    "UDP punch confirmed in {:?}, peer predates the identity proof",
+                                    tm.elapsed()
+                                );
+                                return Ok(None);
+                            }
                         }
-                        acked = true;
+                    } else if let Some(t) = punch_proof_tid(&data[..n]) {
+                        // A proof carrying another nonce is a straggler from an earlier attempt
+                        // on this socket, and says nothing about this one.
+                        if let (Some(pk), Some(expected)) = (verify, auth_tid) {
+                            if t == expected {
+                                if punch_proof_matches(&data[..n], t, pk) {
+                                    log::debug!(
+                                        "UDP punch peer proved its identity in {:?}",
+                                        tm.elapsed()
+                                    );
+                                    proved = true;
+                                    if !listen {
+                                        return Ok(None);
+                                    }
+                                } else {
+                                    // A host that answers the marked probe but signs it with
+                                    // another key is not the peer: wrong address, or a shared one.
+                                    bail!("UDP punch answered by a host that is not the peer");
+                                }
+                            }
+                        }
                     } else if let Some(peer_tid) = punch_tid(&data[..n], &PUNCH_PROBE) {
                         probes_seen += 1;
-                        socket.send(&punch_packet(&PUNCH_ACK, peer_tid)).await.ok();
-                    } else if ack.is_none() && n > 0 {
+                        if is_punch_auth_tid(peer_tid) {
+                            if cached_proof.is_none() {
+                                cached_proof = own_punch_proof(peer_tid);
+                            }
+                            if let Some(p) = cached_proof.as_ref() {
+                                socket.send(p).await.ok();
+                            }
+                        } else {
+                            socket.send(&punch_packet(&PUNCH_ACK, peer_tid)).await.ok();
+                        }
+                    } else if n > 0 {
                         log::debug!(
                             "UDP punch confirmed by {n} bytes of peer data in {:?}, {probes_sent} probes sent",
                             tm.elapsed()
@@ -3190,6 +3415,15 @@ mod tests {
         interval(Duration::from_secs(1))
     }
 
+    async fn connected_loopback_pair() -> (Arc<UdpSocket>, Arc<UdpSocket>) {
+        let a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (a_addr, b_addr) = (a.local_addr().unwrap(), b.local_addr().unwrap());
+        a.connect(b_addr).await.unwrap();
+        b.connect(a_addr).await.unwrap();
+        (Arc::new(a), Arc::new(b))
+    }
+
     fn interval_at_maker() -> Interval {
         interval_at(
             Instant::now() + Duration::from_secs(1),
@@ -3227,6 +3461,126 @@ mod tests {
             elapsed < Duration::from_secs(6),
             "the punch ran for {elapsed:?}; its deadline did not hold"
         );
+    }
+
+    // An old peer reads a marked probe as an ordinary probe and echoes it, and stops its own punch
+    // as soon as it sees a datagram that is neither probe nor acknowledgement - `ack.is_none() &&
+    // n > 0` in the code this replaced. Nothing an upgraded peer sends may look like that before
+    // its round trip is proven, or old peers give up on a hole that works.
+    #[tokio::test]
+    async fn an_old_peer_still_completes_a_verified_punch() {
+        let (a, b) = connected_loopback_pair().await;
+        let handed_peer_data = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = handed_peer_data.clone();
+        let old_peer = tokio::spawn(async move {
+            let mut buf = [0u8; 1500];
+            loop {
+                let Ok(Ok(n)) = tokio::time::timeout(Duration::from_secs(5), b.recv(&mut buf)).await
+                else {
+                    break;
+                };
+                if let Some(peer_tid) = punch_tid(&buf[..n], &PUNCH_PROBE) {
+                    b.send(&punch_packet(&PUNCH_ACK, peer_tid)).await.ok();
+                } else if punch_tid(&buf[..n], &PUNCH_ACK).is_none() {
+                    flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                    break;
+                }
+            }
+        });
+        // A key this peer can never prove, which is the same thing as a peer that cannot prove at
+        // all: the punch has to fall back to the round trip it always used, not fail.
+        let unprovable = sign::gen_keypair().0;
+        let res = punch_udp_verified(a, Some(unprovable)).await;
+        assert!(res.is_ok(), "an old peer must still be accepted: {res:?}");
+        assert!(
+            !handed_peer_data.load(std::sync::atomic::Ordering::SeqCst),
+            "the old peer was handed a datagram it reads as the peer already speaking KCP"
+        );
+        old_peer.abort();
+    }
+
+    // The point of the proof: a host that answers the marked probe but cannot sign it with the key
+    // the rendezvous server vouched for is rejected in one round trip, not after a transport
+    // handshake has had time to time out.
+    #[tokio::test]
+    async fn a_verified_punch_rejects_a_host_that_cannot_prove_itself() {
+        let (a, b) = connected_loopback_pair().await;
+        let listener = tokio::spawn(async move { punch_udp(b, true).await });
+        let wrong = sign::gen_keypair().0;
+        let start = Instant::now();
+        let res = punch_udp_verified(a, Some(wrong)).await;
+        assert!(res.is_err(), "a host that cannot prove itself must be rejected");
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "rejection took {:?}, which is a transport timeout rather than a proof failure",
+            start.elapsed()
+        );
+        listener.abort();
+    }
+
+    // The same exchange from the accepting side: this machine's own identity key is the one a
+    // listener signs with, so a controller that checks against it has to come back Ok.
+    #[tokio::test]
+    async fn a_verified_punch_accepts_the_host_holding_the_key() {
+        let (_, own_pk) = Config::get_key_pair();
+        let Ok(own_pk) = <[u8; 32]>::try_from(own_pk.as_slice()) else {
+            // A build without an identity key has nothing to prove and nothing to check.
+            return;
+        };
+        let (a, b) = connected_loopback_pair().await;
+        let listener = tokio::spawn(async move { punch_udp(b, true).await });
+        let res = punch_udp_verified(a, Some(sign::PublicKey(own_pk))).await;
+        assert!(res.is_ok(), "the host holding the key must be accepted: {res:?}");
+        listener.abort();
+    }
+
+    // A proof is only worth anything if it answers *this* nonce and if only the holder of the key
+    // can produce one, so both ways of being wrong have to fail.
+    #[test]
+    fn punch_proof_only_matches_its_own_nonce_and_key() {
+        let (pk, sk) = sign::gen_keypair();
+        let (_other_pk, other_sk) = sign::gen_keypair();
+        let tid = punch_auth_tid();
+        assert!(is_punch_auth_tid(tid));
+        assert!(!is_punch_auth_tid(PUNCH_AUTH_MAGIC as u64));
+
+        let proof = punch_proof_packet(tid, &sk);
+        assert!(punch_proof_matches(&proof, tid, &pk));
+        assert!(
+            !punch_proof_matches(&proof, tid ^ 1, &pk),
+            "another nonce must not match"
+        );
+
+        let impostor = punch_proof_packet(tid, &other_sk);
+        assert!(
+            !punch_proof_matches(&impostor, tid, &pk),
+            "another identity must not match"
+        );
+
+        let mut tampered = proof.to_vec();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 1;
+        assert!(!punch_proof_matches(&tampered, tid, &pk));
+    }
+
+    // A peer from before the proof answers the marked probe the way it answers any probe: with an
+    // unsigned echo of the same 12-byte shape. Nothing about either packet may look like a punch
+    // packet or like peer data to it.
+    #[test]
+    fn punch_auth_probe_keeps_the_plain_probe_shape() {
+        let tid = punch_auth_tid();
+        let probe = punch_packet(&PUNCH_PROBE, tid);
+        assert_eq!(probe.len(), PUNCH_PACKET_LEN);
+        assert_eq!(punch_tid(&probe, &PUNCH_PROBE), Some(tid));
+        assert_eq!(punch_tid(&probe, &PUNCH_ACK), None);
+        assert!(is_punch_auth_tid(tid));
+
+        let (_pk, sk) = sign::gen_keypair();
+        let proof = punch_proof_packet(tid, &sk);
+        assert!(proof.len() > PUNCH_PACKET_LEN);
+        assert_eq!(punch_tid(&proof, &PUNCH_PROBE), None);
+        assert_eq!(punch_tid(&proof, &PUNCH_ACK), None);
+        assert_eq!(punch_proof_tid(&proof), Some(tid));
     }
 
     #[test]

@@ -214,22 +214,30 @@ impl Drop for OffererGuard {
     }
 }
 
-/// Race WebRTC against the other transports, preferring P2P: `select_ok` would always pick the
-/// relay, whose TCP connect beats ICE + DTLS + SCTP by an order of magnitude. An `is_p2p` result
-/// wins outright; a relayed one — from either side, since `webrtc_fut` is a whole punch attempt
-/// that can also end in a relay — is held for `window_ms` to give the other side a chance.
+/// Race the rounds of a punch against each other, preferring one of them: `select_ok` would
+/// otherwise let the quickest round decide, which is the relay when a punch round exists and the
+/// relay's TCP connect beats a punch by an order of magnitude. An `is_p2p` result from `preferred`
+/// wins outright; anything slower — from either side, since `preferred` is a whole punch attempt
+/// that can also end in a relay — is held for `window_ms` to give the preferred round a chance.
+///
+/// `rank_others_below_preferred` makes the window apply to *every* result from `others`, direct
+/// ones included. That is what orders the transports as UDP punch, then TCP punch, then relay: the
+/// two punch rounds have to run at the same time (a punch only lands while both sides are
+/// punching), so ranking them means holding the faster round's answer for the window instead of
+/// sequencing the rounds.
 ///
 /// `others` must be non-empty (`select_ok` requires it).
-async fn race_transports_prefer_webrtc<'a, T: 'a>(
-    webrtc_fut: BoxFuture<'a, ResultType<T>>,
+async fn race_prefer_round<'a, T: 'a>(
+    preferred: BoxFuture<'a, ResultType<T>>,
     others: Vec<BoxFuture<'a, ResultType<T>>>,
     window_ms: u64,
     is_p2p: impl Fn(&T) -> bool,
+    rank_others_below_preferred: bool,
 ) -> ResultType<T> {
-    let mut webrtc_fut = Some(webrtc_fut);
+    let mut preferred_fut = Some(preferred);
     let mut others_fut = Some(select_ok(others));
     let mut held: Option<T> = None;
-    let mut webrtc_err: Option<hbb_common::anyhow::Error> = None;
+    let mut preferred_err: Option<hbb_common::anyhow::Error> = None;
     let mut others_err: Option<hbb_common::anyhow::Error> = None;
     let window = tokio::time::sleep(Duration::from_millis(window_ms));
     tokio::pin!(window);
@@ -237,17 +245,17 @@ async fn race_transports_prefer_webrtc<'a, T: 'a>(
     loop {
         tokio::select! {
             res = async {
-                match webrtc_fut.as_mut() {
+                match preferred_fut.as_mut() {
                     Some(fut) => fut.await,
                     None => std::future::pending().await,
                 }
-            }, if webrtc_fut.is_some() => {
-                webrtc_fut = None;
+            }, if preferred_fut.is_some() => {
+                preferred_fut = None;
                 match res {
                     // A direct connection is the outcome this race exists to protect: commit it
                     // outright, and a held relay conn just drops.
                     Ok(conn) if is_p2p(&conn) || others_fut.is_none() => return Ok(conn),
-                    // `webrtc_fut` is a whole punch attempt, not just the WebRTC connect, so it
+                    // `preferred_fut` is a whole punch attempt, not just the WebRTC connect, so it
                     // can end in a relay of its own. Committing that immediately would preempt a
                     // direct punch still in flight on the other branch — the exact inversion this
                     // function exists to prevent — so hold it on the same terms as any relay.
@@ -276,8 +284,8 @@ async fn race_transports_prefer_webrtc<'a, T: 'a>(
                                 log::warn!("fallback leg also failed: {}", oe);
                                 return Err(e);
                             }
-                            None if others_fut.is_none() => bail!("WebRTC failed: {}", e),
-                            None => webrtc_err = Some(e),
+                            None if others_fut.is_none() => bail!("preferred leg failed: {}", e),
+                            None => preferred_err = Some(e),
                         }
                     }
                 }
@@ -291,13 +299,14 @@ async fn race_transports_prefer_webrtc<'a, T: 'a>(
                 others_fut = None;
                 match res {
                     Ok((conn, unfinished)) => {
-                        if is_p2p(&conn) {
+                        if is_p2p(&conn) && !rank_others_below_preferred {
                             return Ok(conn);
                         }
-                        // Relayed: commit now only if nothing direct can still arrive. If a
-                        // direct attempt is still in flight (here or in `unfinished`), hold it
-                        // and keep racing for the preference window instead of discarding them.
-                        if webrtc_fut.is_none() && unfinished.is_empty() {
+                        // Relayed, or ranked below the preferred round: commit now only if
+                        // nothing better can still arrive. If a preferred result is still in
+                        // flight (here or in `unfinished`), hold it and keep racing for the
+                        // preference window instead of discarding them.
+                        if preferred_fut.is_none() && unfinished.is_empty() {
                             return Ok(conn);
                         }
                         if held.is_none() {
@@ -311,17 +320,17 @@ async fn race_transports_prefer_webrtc<'a, T: 'a>(
                             others_fut = Some(select_ok(unfinished));
                         }
                     }
-                    Err(e) => match webrtc_err.take() {
+                    Err(e) => match preferred_err.take() {
                         // Nothing more can win, but a parked relay is still a valid outcome — take
                         // it before failing the connection.
                         Some(we) => match held.take() {
                             Some(conn) => return Ok(conn),
                             None => {
-                                log::warn!("WebRTC leg also failed: {}", we);
+                                log::warn!("preferred leg also failed: {}", we);
                                 return Err(e);
                             }
                         },
-                        None if webrtc_fut.is_none() => match held.take() {
+                        None if preferred_fut.is_none() => match held.take() {
                             Some(conn) => return Ok(conn),
                             None => return Err(e),
                         },
@@ -337,6 +346,17 @@ async fn race_transports_prefer_webrtc<'a, T: 'a>(
             }
         }
     }
+}
+
+/// [`race_prefer_round`] with the ranking the WebRTC call sites want: the other transports may win
+/// outright when they are direct.
+async fn race_transports_prefer_webrtc<'a, T: 'a>(
+    preferred: BoxFuture<'a, ResultType<T>>,
+    others: Vec<BoxFuture<'a, ResultType<T>>>,
+    window_ms: u64,
+    is_p2p: impl Fn(&T) -> bool,
+) -> ResultType<T> {
+    race_prefer_round(preferred, others, window_ms, is_p2p, false).await
 }
 
 // A peer decides how many ICE candidates it sends, and the rendezvous route that carries them is
@@ -366,6 +386,55 @@ fn tcp_punch_allowed() -> bool {
             || crate::get_ipv6_punch_enabled()
             || crate::get_webrtc_enabled())
 }
+
+/// What a rendezvous response adds to a punch beyond the single address the server observes for
+/// itself: the extra addresses the peer announced, and the identity key to check the peer against.
+///
+/// Filled from `PunchHoleResponse.socket_addr_list`, which a server that does not relay the field
+/// leaves empty - in which case this is exactly the punch as it was.
+#[derive(Clone, Default)]
+struct PunchExtra {
+    candidates: Vec<SocketAddr>,
+    verify: Option<sign::PublicKey>,
+}
+
+impl PunchExtra {
+    fn from_punch_hole_response(ph: &PunchHoleResponse, primary: SocketAddr) -> Self {
+        let mut candidates = Vec::new();
+        // The announced addresses are the punching socket's, and it only exists when the peer
+        // punched with UDP: with a TCP punch there is nothing listening on them.
+        if ph.is_udp {
+            for addr in ph.socket_addr_list.iter().map(|a| AddrMangle::decode(a)) {
+                if addr.port() > 0 && addr != primary && !candidates.contains(&addr) {
+                    candidates.push(addr);
+                }
+                if candidates.len() >= crate::common::MAX_PUNCH_CANDIDATES {
+                    break;
+                }
+            }
+        }
+        Self {
+            candidates,
+            verify: None,
+        }
+    }
+
+    /// The addresses to punch, in order: the one the server observed first, because that is the
+    /// order the punch has always had, then the ones the peer announced for itself.
+    fn udp_candidates(&self, primary: SocketAddr) -> Vec<SocketAddr> {
+        let mut addrs = vec![primary];
+        for addr in &self.candidates {
+            if !addrs.contains(addr) {
+                addrs.push(*addr);
+            }
+        }
+        addrs
+    }
+}
+
+/// How long the addresses the peer announced may add to the UDP attempt. An address that is wrong
+/// costs a whole punch window, so they share this instead of each getting one of their own.
+const EXTRA_CANDIDATE_BUDGET: Duration = Duration::from_secs(4);
 
 impl Client {
     const CLIENT_CLIPBOARD_NAME: &'static str = "client-clipboard";
@@ -592,11 +661,19 @@ impl Client {
             )
             .await;
         }
-        let connect_futures = vec![preferred_fut, fallback_fut];
-        match select_ok(connect_futures).await {
-            Ok(conn) => Ok((conn.0 .0, conn.0 .1, conn.0 .2)),
-            Err(e) => Err(e),
-        }
+        // UDP punch first, then the TCP punch, then whatever relay either round fell back to. The
+        // two rounds race because a punch only lands while both sides are punching, and the faster
+        // round's answer is held for the window rather than reported first: the TCP punch usually
+        // completes first, and reporting it at once would make the order decided by which round is
+        // quicker instead of by the order the user asked for.
+        race_prefer_round(
+            preferred_fut,
+            vec![fallback_fut],
+            Self::TCP_PUNCH_PREFERENCE_MS,
+            |result| result.0 .1,
+            true,
+        )
+        .await
     }
 
     fn is_expected_webrtc_ice_candidate(ice: &IceCandidate, session_key: &str) -> bool {
@@ -634,6 +711,12 @@ impl Client {
     /// checks + DTLS on high-latency links; short enough that UDP-blocked networks settle on
     /// relay without a noticeable wait. The same role RFC 8305 calls a connection attempt delay.
     const RELAY_FALLBACK_DELAY_MS: u64 = 2500;
+
+    /// How long the TCP punch round's answer is held back so the UDP punch round can land first.
+    /// Both rounds punch at once, so this is a ranking delay on the answer, not on the punches
+    /// themselves; a UDP punch that works normally completes well inside it, and one that is
+    /// blocked costs this much before the TCP connection is reported instead.
+    const TCP_PUNCH_PREFERENCE_MS: u64 = 1500;
 
     /// The delay as the user configured it, falling back to `RELAY_FALLBACK_DELAY_MS`. The
     /// settings field holds seconds, which is what a user reasons about; everything here is
@@ -845,6 +928,7 @@ impl Client {
         let mut socket = socket?;
         let mut my_addr = socket.local_addr();
         let mut signed_id_pk = Vec::new();
+        let mut punch_extra = PunchExtra::default();
         let mut relay_server = "".to_owned();
         let mut peer_addr = Config::get_any_listen_addr(true);
         let mut peer_nat_type = NatType::UNKNOWN_NAT;
@@ -1022,6 +1106,11 @@ impl Client {
                                 _ => bail!("other punch hole failure"),
                             }
                         } else {
+                            // Read before any field is moved out of `ph` below.
+                            let punch_candidates = PunchExtra::from_punch_hole_response(
+                                &ph,
+                                AddrMangle::decode(&ph.socket_addr),
+                            );
                             peer_nat_type = ph.nat_type();
                             is_local = ph.is_local();
                             signed_id_pk = ph.pk.into();
@@ -1029,6 +1118,10 @@ impl Client {
                             peer_addr = AddrMangle::decode(&ph.socket_addr);
                             feedback = ph.feedback;
                             webrtc_sdp_answer = ph.webrtc_sdp_answer;
+                            punch_extra = PunchExtra {
+                                verify: crate::common::punch_verify_key(&signed_id_pk, &key),
+                                ..punch_candidates
+                            };
                             let s = udp.0.take();
                             if udp_nat_port > 0 && ph.is_udp && s.is_some() {
                                 if let Some(s) = s {
@@ -1064,8 +1157,13 @@ impl Client {
                                 if s.connect(addr).await.is_ok() {
                                     connect_futures.push(
                                         async move {
-                                            let (conn, kcp, typ) =
-                                                udp_nat_connect(s, "IPv6", CONNECT_TIMEOUT).await?;
+                                            let (conn, kcp, typ) = udp_nat_connect(
+                                                s,
+                                                "IPv6",
+                                                CONNECT_TIMEOUT,
+                                                None,
+                                            )
+                                            .await?;
                                             Ok((conn, kcp, typ, true))
                                         }
                                         .boxed(),
@@ -1388,6 +1486,7 @@ impl Client {
                 webrtc_bridge_stop,
                 allow_tcp_punch,
                 &punch_type,
+                punch_extra,
             )
             .await?,
             (feedback, rendezvous_server),
@@ -1417,6 +1516,7 @@ impl Client {
         webrtc_bridge_stop: Option<oneshot::Sender<()>>,
         allow_tcp_punch: bool,
         punch_type: &str,
+        punch_extra: PunchExtra,
     ) -> ResultType<(
         Stream,
         bool,
@@ -1477,20 +1577,44 @@ impl Client {
             );
         }
         if let Some(udp_socket_nat) = udp_socket_nat {
+            // The verified punch rides along with the first candidate: it costs no extra round
+            // trip, and it is what makes a wrong address cheap to give up on below.
+            let verify = punch_extra.verify;
+            let candidates = punch_extra.udp_candidates(peer);
             direct_futures.push(
                 async move {
-                    let (conn, kcp, typ) =
-                        udp_nat_connect(udp_socket_nat, "UDP", connect_timeout).await?;
-                    Ok((conn, kcp, typ, true))
+                    let mut last_err = None;
+                    let extra_started = std::time::Instant::now();
+                    for addr in candidates {
+                        if addr != peer {
+                            // One wrong address costs a whole punch window, so the extras share a
+                            // budget instead of each getting one of its own.
+                            if extra_started.elapsed() > EXTRA_CANDIDATE_BUDGET {
+                                log::info!("gave up on the remaining UDP candidates");
+                                break;
+                            }
+                            if udp_socket_nat.connect(addr).await.is_err() {
+                                continue;
+                            }
+                        }
+                        match udp_nat_connect(udp_socket_nat.clone(), "UDP", connect_timeout, verify)
+                            .await
+                        {
+                            Ok(res) => return Ok((res.0, res.1, res.2, true)),
+                            Err(err) => last_err = Some(err),
+                        }
+                    }
+                    Err(last_err.unwrap_or_else(|| anyhow!("UDP punch failed")))
                 }
                 .boxed(),
             );
         }
         if let Some(udp_socket_v6) = udp_socket_v6 {
+            let verify = punch_extra.verify;
             direct_futures.push(
                 async move {
                     let (conn, kcp, typ) =
-                        udp_nat_connect(udp_socket_v6, "IPv6", connect_timeout).await?;
+                        udp_nat_connect(udp_socket_v6, "IPv6", connect_timeout, verify).await?;
                     Ok((conn, kcp, typ, true))
                 }
                 .boxed(),
@@ -5573,8 +5697,9 @@ async fn udp_nat_connect(
     socket: Arc<UdpSocket>,
     typ: &'static str,
     ms_timeout: u64,
+    verify: Option<sign::PublicKey>,
 ) -> ResultType<(Stream, Option<KcpStream>, &'static str)> {
-    crate::punch_udp(socket.clone(), false)
+    crate::punch_udp_verified(socket.clone(), verify)
         .await
         .map_err(|err| {
             log::debug!("{err}");
@@ -5591,7 +5716,7 @@ async fn udp_nat_connect(
 
 #[cfg(test)]
 mod webrtc_race_tests {
-    use super::race_transports_prefer_webrtc;
+    use super::{race_prefer_round, race_transports_prefer_webrtc};
     use hbb_common::{
         anyhow::anyhow,
         futures::future::{BoxFuture, FutureExt},
@@ -5791,6 +5916,58 @@ mod webrtc_race_tests {
             .unwrap_err();
             assert_eq!(err.to_string(), "Remote desktop is offline");
         }
+    }
+
+    // Ranking a round below the preferred one holds even a *direct* result from it. The TCP punch
+    // normally completes first, so committing it on arrival would decide the transport order by
+    // which round is quicker instead of by the ranking.
+    #[tokio::test]
+    async fn ranked_round_holds_a_direct_result_for_the_preferred_one() {
+        let got = race_prefer_round(
+            ok_after(300, "udp"),
+            vec![ok_after(10, "tcp")],
+            60_000,
+            |_| true,
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(got, "udp");
+    }
+
+    #[tokio::test]
+    async fn ranked_round_reports_the_held_result_once_the_preferred_one_fails() {
+        let got = race_prefer_round(
+            err_after(200, "udp punch failed"),
+            vec![ok_after(10, "tcp")],
+            60_000,
+            |_| true,
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(got, "tcp");
+    }
+
+    // A preferred round that never lands must not hold the ranked one forever.
+    #[tokio::test]
+    async fn ranked_round_gives_up_after_the_window() {
+        let start = Instant::now();
+        let got = race_prefer_round(
+            ok_after(60_000, "udp"),
+            vec![ok_after(10, "tcp")],
+            100,
+            |_| true,
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(got, "tcp");
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "the window did not bound the wait: {:?}",
+            start.elapsed()
+        );
     }
 }
 

@@ -1210,13 +1210,23 @@ impl RendezvousMediator {
         &self,
         peer_addr: SocketAddr,
         server: ServerPtr,
-        msg_punch: PunchHoleSent,
+        mut msg_punch: PunchHoleSent,
         meta: ConnectionMeta,
         slot: Option<PunchSlot>,
     ) -> ResultType<()> {
+        let (socket, addr) = new_direct_udp_for(&self.host).await?;
+        // Announce the punch socket on every local address too. The server only ever sees the one
+        // mapping it is reached through, which is the wrong one both when the peer sits on the
+        // same network and when the NAT maps per destination. A server that does not relay the
+        // field drops it there, and the punch is then the single-address one it always was.
+        if let Ok(local_addr) = socket.local_addr() {
+            if local_addr.port() > 0 {
+                msg_punch.socket_addr_list =
+                    crate::common::punch_local_candidates(local_addr.port());
+            }
+        }
         let mut msg_out = Message::new();
         msg_out.set_punch_hole_sent(msg_punch);
-        let (socket, addr) = new_direct_udp_for(&self.host).await?;
         let data = msg_out.write_to_bytes()?;
         socket.send_to(&data, addr).await?;
         // The reply is out, and with it the answer and the v6 address: declined is the listen
