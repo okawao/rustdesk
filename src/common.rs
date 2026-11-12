@@ -3034,29 +3034,41 @@ pub fn punch_verify_key(signed_id_pk: &[u8], licence_key: &str) -> Option<sign::
         .map(|(_, pk)| sign::PublicKey(pk))
 }
 
-/// The addresses this punch socket can be reached on besides the one the server observes, for the
-/// peer to try when that one is the wrong mapping. `AddrMangle`-encoded.
+/// The addresses this socket is reachable on besides the one the server observes, for the peer to
+/// try when that one is the wrong mapping. `AddrMangle`-encoded for the wire.
 #[cfg(not(target_os = "ios"))]
 pub fn punch_local_candidates(port: u16) -> Vec<Bytes> {
-    let mut candidates = Vec::new();
+    punch_local_addrs(port)
+        .into_iter()
+        .map(|addr| hbb_common::AddrMangle::encode(addr).into())
+        .collect()
+}
+
+#[cfg(target_os = "ios")]
+pub fn punch_local_candidates(_port: u16) -> Vec<Bytes> {
+    Vec::new()
+}
+
+/// The same addresses, for the side that binds or dials them rather than announcing them.
+#[cfg(not(target_os = "ios"))]
+pub fn punch_local_addrs(port: u16) -> Vec<SocketAddr> {
+    let mut addrs = Vec::new();
     for interface in default_net::get_interfaces() {
         for ipv4 in &interface.ipv4 {
             if ipv4.addr.is_unspecified() || ipv4.addr.is_loopback() {
                 continue;
             }
-            candidates.push(
-                hbb_common::AddrMangle::encode(SocketAddr::from((ipv4.addr, port))).into(),
-            );
-            if candidates.len() >= MAX_PUNCH_CANDIDATES {
-                return candidates;
+            addrs.push(SocketAddr::from((ipv4.addr, port)));
+            if addrs.len() >= MAX_PUNCH_CANDIDATES {
+                return addrs;
             }
         }
     }
-    candidates
+    addrs
 }
 
 #[cfg(target_os = "ios")]
-pub fn punch_local_candidates(_port: u16) -> Vec<Bytes> {
+pub fn punch_local_addrs(_port: u16) -> Vec<SocketAddr> {
     Vec::new()
 }
 

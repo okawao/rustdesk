@@ -396,32 +396,34 @@ fn tcp_punch_allowed() -> bool {
 struct PunchExtra {
     candidates: Vec<SocketAddr>,
     verify: Option<sign::PublicKey>,
+    /// Whether the announced addresses belong to a UDP punch socket, dialled with probes, or to the
+    /// TCP punch's listener, dialled with a SYN.
+    udp: bool,
 }
 
 impl PunchExtra {
     fn from_punch_hole_response(ph: &PunchHoleResponse, primary: SocketAddr) -> Self {
         let mut candidates = Vec::new();
-        // The announced addresses are the punching socket's, and it only exists when the peer
-        // punched with UDP: with a TCP punch there is nothing listening on them.
-        if ph.is_udp {
-            for addr in ph.socket_addr_list.iter().map(|a| AddrMangle::decode(a)) {
-                if addr.port() > 0 && addr != primary && !candidates.contains(&addr) {
-                    candidates.push(addr);
-                }
-                if candidates.len() >= crate::common::MAX_PUNCH_CANDIDATES {
-                    break;
-                }
+        // The addresses the punching socket announced for itself, in whichever form that round
+        // punched: a UDP socket for a udp punch, the listening port for a tcp punch.
+        for addr in ph.socket_addr_list.iter().map(|a| AddrMangle::decode(a)) {
+            if addr.port() > 0 && addr != primary && !candidates.contains(&addr) {
+                candidates.push(addr);
+            }
+            if candidates.len() >= crate::common::MAX_PUNCH_CANDIDATES {
+                break;
             }
         }
         Self {
             candidates,
             verify: None,
+            udp: ph.is_udp,
         }
     }
 
     /// The addresses to punch, in order: the one the server observed first, because that is the
     /// order the punch has always had, then the ones the peer announced for itself.
-    fn udp_candidates(&self, primary: SocketAddr) -> Vec<SocketAddr> {
+    fn punch_order(&self, primary: SocketAddr) -> Vec<SocketAddr> {
         let mut addrs = vec![primary];
         for addr in &self.candidates {
             if !addrs.contains(addr) {
@@ -1573,11 +1575,32 @@ impl Client {
         // always direct; WebRTC is direct only when ICE nominated a non-TURN pair.
         let mut direct_futures = Vec::new();
         if allow_tcp_punch {
-            let fut = connect_tcp_local(peer, Some(local_addr), connect_timeout);
+            // The peer announced the listener on its other addresses too, and it is dialled the
+            // same way as the one the server observed: which of them is reachable is the peer's
+            // routing to decide, not this side's.
+            let candidates = if punch_extra.udp {
+                vec![peer]
+            } else {
+                punch_extra.punch_order(peer)
+            };
             direct_futures.push(
                 async move {
-                    let conn = fut.await?;
-                    Ok((conn, None, "TCP", true))
+                    let mut last_err = None;
+                    let extra_started = std::time::Instant::now();
+                    for addr in candidates {
+                        if addr != peer && extra_started.elapsed() > EXTRA_CANDIDATE_BUDGET {
+                            log::info!("gave up on the remaining TCP punch addresses");
+                            break;
+                        }
+                        // The local address stays the same one throughout: it is what the peer's
+                        // punch is aimed at, and what makes this a simultaneous open instead of a
+                        // plain connect.
+                        match connect_tcp_local(addr, Some(local_addr), connect_timeout).await {
+                            Ok(conn) => return Ok((conn, None, "TCP", true)),
+                            Err(err) => last_err = Some(err),
+                        }
+                    }
+                    Err(last_err.unwrap_or_else(|| anyhow!("TCP punch failed")))
                 }
                 .boxed(),
             );
@@ -1586,7 +1609,11 @@ impl Client {
             // The verified punch rides along with the first candidate: it costs no extra round
             // trip, and it is what makes a wrong address cheap to give up on below.
             let verify = punch_extra.verify;
-            let candidates = punch_extra.udp_candidates(peer);
+            let candidates = if punch_extra.udp {
+                punch_extra.punch_order(peer)
+            } else {
+                vec![peer]
+            };
             direct_futures.push(
                 async move {
                     let mut last_err = None;

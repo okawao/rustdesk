@@ -1144,7 +1144,7 @@ impl RendezvousMediator {
         }
         use hbb_common::protobuf::Enum;
         let nat_type = NatType::from_i32(Config::get_nat_type()).unwrap_or(NatType::UNKNOWN_NAT);
-        let msg_punch = PunchHoleSent {
+        let mut msg_punch = PunchHoleSent {
             socket_addr: ph.socket_addr,
             id: Config::get_id(),
             relay_server,
@@ -1185,6 +1185,14 @@ impl RendezvousMediator {
             allow_err!(socket_client::connect_tcp_local(peer_addr, Some(local_addr), 30).await);
             socket
         };
+        // Announce the listener on every local address, as the UDP round does: the server only ever
+        // sees the one mapping the hbbs connection is reached through, which is the wrong one for a
+        // peer on this machine's LAN or VPN.
+        let listen_addr = socket.local_addr();
+        if listen_addr.port() > 0 {
+            msg_punch.socket_addr_list =
+                crate::common::punch_local_candidates(listen_addr.port());
+        }
         let mut msg_out = Message::new();
         msg_out.set_punch_hole_sent(msg_punch);
         let bytes = msg_out.write_to_bytes()?;
@@ -1565,29 +1573,40 @@ async fn punch_tcp_until_connected(
 
     // Not fatal on its own - the punch below can still meet the controller's SYN without it, and
     // that half is the one a listener the OS refused to bind could not have covered anyway.
-    let listener = match new_listener(local_addr, true).await {
-        Ok(listener) => {
-            log::info!("Server listening on: {local_addr}");
-            Some(listener)
+    //
+    // One listener per local address, all on the port the hbbs connection went out from: the
+    // controller is told every address this machine has, and the mapping hbbs observed is only the
+    // one a peer on a LAN or a VPN does not need. `local_addr` stays shared with the punch below
+    // through the reuse flags; every other address is free at that port.
+    let mut listeners = Vec::new();
+    let mut listen_addrs = vec![local_addr];
+    listen_addrs.extend(
+        crate::common::punch_local_addrs(local_addr.port())
+            .into_iter()
+            .filter(|addr| *addr != local_addr),
+    );
+    for addr in listen_addrs {
+        match new_listener(addr, true).await {
+            Ok(listener) => {
+                log::info!("Server listening on: {addr}");
+                listeners.push(listener);
+            }
+            Err(err) => log::warn!("Failed to listen on {addr} after punching: {err}"),
         }
-        Err(err) => {
-            log::warn!("Failed to listen on {local_addr} after punching: {err}");
-            None
-        }
-    };
+    }
     // Bounds both halves: the punch keeps the mapping open only while the accept is still
     // willing to take a connection through it.
     let until = Instant::now() + Duration::from_millis(CONNECT_TIMEOUT);
     let punch = punch_until(until, peer_addr, |ms| {
         socket_client::connect_tcp_local(peer_addr, Some(local_addr), ms)
     });
-    let Some(listener) = listener else {
+    if listeners.is_empty() {
         if let Some(stream) = punch.await {
             drop(slot);
             serve_punched(server, stream, peer_addr, meta).await;
         }
         return;
-    };
+    }
     // Accepting in a loop, not once: a transient `accept` error must not spend the whole window
     // the controller still has to arrive in.
     let accept = async {
@@ -1596,13 +1615,16 @@ async fn punch_tcp_until_connected(
             if left == 0 {
                 break;
             }
-            match hbb_common::timeout(left, listener.accept()).await {
+            let accept_any = hbb_common::futures::future::select_all(
+                listeners.iter().map(|l| Box::pin(l.accept())),
+            );
+            match hbb_common::timeout(left, accept_any).await {
                 // Not filtered by address, as `accept_connection` never did: hbbs saw the
                 // controller through one mapping and a NAT that pools its external addresses may
                 // dial us from another, and what keeps `meta`'s control permissions from a second
                 // peer is the handshake, plus that exactly one connection is ever served.
-                Ok(Ok(accepted)) => return Some(accepted),
-                Ok(Err(err)) => {
+                Ok((Ok(accepted), _, _)) => return Some(accepted),
+                Ok((Err(err), _, _)) => {
                     log::warn!("Failed to accept from {peer_addr}: {err}");
                     // One that persists - EMFILE, say - would otherwise spin here for the window.
                     sleep(1.).await;
