@@ -434,10 +434,6 @@ impl PunchExtra {
     }
 }
 
-/// How long the addresses the peer announced may add to the UDP attempt. An address that is wrong
-/// costs a whole punch window, so they share this instead of each getting one of their own.
-const EXTRA_CANDIDATE_BUDGET: Duration = Duration::from_secs(4);
-
 impl Client {
     const CLIENT_CLIPBOARD_NAME: &'static str = "client-clipboard";
 
@@ -1575,9 +1571,9 @@ impl Client {
         // always direct; WebRTC is direct only when ICE nominated a non-TURN pair.
         let mut direct_futures = Vec::new();
         if allow_tcp_punch {
-            // The peer announced the listener on its other addresses too, and it is dialled the
-            // same way as the one the server observed: which of them is reachable is the peer's
-            // routing to decide, not this side's.
+            // Every address the peer announced is dialled at once, not one after another: the peer
+            // listens on all of them, so they are independent connects, and a wrong one then costs
+            // nothing but the socket it holds until another answers.
             let candidates = if punch_extra.udp {
                 vec![peer]
             } else {
@@ -1585,29 +1581,33 @@ impl Client {
             };
             direct_futures.push(
                 async move {
-                    let mut last_err = None;
-                    let extra_started = std::time::Instant::now();
+                    let mut legs = Vec::with_capacity(candidates.len());
                     for addr in candidates {
-                        if addr != peer && extra_started.elapsed() > EXTRA_CANDIDATE_BUDGET {
-                            log::info!("gave up on the remaining TCP punch addresses");
-                            break;
-                        }
-                        // The local address stays the same one throughout: it is what the peer's
-                        // punch is aimed at, and what makes this a simultaneous open instead of a
-                        // plain connect.
-                        match connect_tcp_local(addr, Some(local_addr), connect_timeout).await {
-                            Ok(conn) => return Ok((conn, None, "TCP", true)),
-                            Err(err) => last_err = Some(err),
-                        }
+                        // Only the address the server observed is dialled from the punch's local
+                        // address: that is the mapping the peer's punch is aimed at, and holding
+                        // the port is what makes this a simultaneous open. The peer's other
+                        // addresses have a listener of their own, so a plain connect reaches
+                        // them - and they must not share that port, one local address matching one
+                        // socket and the peer's crossing SYN landing on whichever bound last. The
+                        // route also has to pick the source, or a peer reached through a tunnel
+                        // sees a source it cannot answer.
+                        let local = (addr == peer).then_some(local_addr);
+                        legs.push(
+                            async move {
+                                let conn = connect_tcp_local(addr, local, connect_timeout).await?;
+                                Ok((conn, None, "TCP", true))
+                            }
+                            .boxed(),
+                        );
                     }
-                    Err(last_err.unwrap_or_else(|| anyhow!("TCP punch failed")))
+                    select_ok(legs).await.map(|x| x.0)
                 }
                 .boxed(),
             );
         }
         if let Some(udp_socket_nat) = udp_socket_nat {
             // The verified punch rides along with the first candidate: it costs no extra round
-            // trip, and it is what makes a wrong address cheap to give up on below.
+            // trip, and it is what makes a wrong address cheap to give up on there.
             let verify = punch_extra.verify;
             let candidates = if punch_extra.udp {
                 punch_extra.punch_order(peer)
@@ -1616,28 +1616,37 @@ impl Client {
             };
             direct_futures.push(
                 async move {
-                    let mut last_err = None;
-                    let extra_started = std::time::Instant::now();
+                    let mut legs = Vec::with_capacity(candidates.len());
                     for addr in candidates {
-                        if addr != peer {
-                            // One wrong address costs a whole punch window, so the extras share a
-                            // budget instead of each getting one of its own.
-                            if extra_started.elapsed() > EXTRA_CANDIDATE_BUDGET {
-                                log::info!("gave up on the remaining UDP candidates");
-                                break;
+                        // One socket per address, all probing at once: a connected UDP socket
+                        // carries a single peer, and the punch's own is the one whose port the
+                        // peer was told. An announced address gets its own, left on the wildcard
+                        // so the route picks the source - the only way a peer reached through a
+                        // tunnel sees one it can answer.
+                        let socket = if addr == peer {
+                            udp_socket_nat.clone()
+                        } else {
+                            match new_udp_punch_socket(addr).await {
+                                Ok(socket) => socket,
+                                Err(err) => {
+                                    log::debug!("No UDP punch socket for {addr}: {err}");
+                                    continue;
+                                }
                             }
-                            if udp_socket_nat.connect(addr).await.is_err() {
-                                continue;
+                        };
+                        if addr != peer && socket.connect(addr).await.is_err() {
+                            continue;
+                        }
+                        legs.push(
+                            async move {
+                                let res =
+                                    udp_nat_connect(socket, "UDP", connect_timeout, verify).await?;
+                                Ok((res.0, res.1, res.2, true))
                             }
-                        }
-                        match udp_nat_connect(udp_socket_nat.clone(), "UDP", connect_timeout, verify)
-                            .await
-                        {
-                            Ok(res) => return Ok((res.0, res.1, res.2, true)),
-                            Err(err) => last_err = Some(err),
-                        }
+                            .boxed(),
+                        );
                     }
-                    Err(last_err.unwrap_or_else(|| anyhow!("UDP punch failed")))
+                    select_ok(legs).await.map(|x| x.0)
                 }
                 .boxed(),
             );
@@ -5723,6 +5732,13 @@ async fn test_udp_uat(
         final_port > 0
     );
     Ok(())
+}
+
+/// One announced punch address's own socket. Bound to the wildcard rather than to the address this
+/// host reaches it through, so the kernel takes the source from the route.
+async fn new_udp_punch_socket(addr: SocketAddr) -> ResultType<Arc<UdpSocket>> {
+    let local = Config::get_any_listen_addr(addr.is_ipv4());
+    Ok(Arc::new(UdpSocket::bind(local).await?))
 }
 
 #[inline]
