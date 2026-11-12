@@ -1096,13 +1096,15 @@ impl RendezvousMediator {
         };
         // Whether the v4 legs relay is known here, and decides whether a v4 place is taken at
         // all: the relay branch below runs the whole session, and a place held across it would
-        // let ordinary relay traffic use the pool up. The v6 punch is not relayed with them - a
-        // symmetric NAT on v4 says nothing about v6 - and its place is taken after the v4 one,
-        // or it could be the last and leave the punch the peer counts on with none.
-        let relay_v4 = ph.nat_type.enum_value() == Ok(NatType::SYMMETRIC)
-            || Config::get_nat_type() == NatType::SYMMETRIC as i32
-            || relay
-            || (config::is_disable_tcp_listen() && ph.udp_port <= 0);
+        // let ordinary relay traffic use the pool up. The v6 punch is not relayed with them - the
+        // v4 legs relaying says nothing about v6 - and its place is taken after the v4 one, or it
+        // could be the last and leave the punch the peer counts on with none.
+        //
+        // A symmetric NAT does not relay on its own: it only makes a hole unlikely, and the rounds
+        // that fail have the relay waiting for them anyway. What relays is a transport that needs
+        // it - ws, a proxy, the peer's own `force_relay`, all of which `relay` already carries -
+        // and a machine that cannot listen, which has no TCP punch to offer.
+        let relay_v4 = relay || (config::is_disable_tcp_listen() && ph.udp_port <= 0);
         let punch_udp = !relay_v4 && ph.udp_port > 0;
         let punch_tcp = !relay_v4 && ph.udp_port <= 0 && ph.webrtc_sdp_offer.is_empty();
         let punch_v6 = peer_addr_v6.port() > 0 && !relay;
@@ -1120,11 +1122,10 @@ impl RendezvousMediator {
         }
         let relay_server = self.get_relay_server(ph.relay_server);
         // for ensure, websocket go relay directly
-        // A symmetric NAT relays the legacy transports but deliberately not WebRTC: the answer
-        // built above rides along on the relay request, and ICE probes the candidate pairs rather
-        // than trusting this classification, so a direct WebRTC pair can still form on a
-        // connection this branch has already called relay-only. Do not gate the answerer on
-        // nat_type to make the two agree.
+        // A forced relay still answers WebRTC: the answer built above rides along on the relay
+        // request, and ICE probes the candidate pairs rather than trusting this classification, so
+        // a direct WebRTC pair can still form on a connection this branch has already called
+        // relay-only. Do not gate the answerer on the same flag to make the two agree.
         if relay_v4 {
             let uuid = Uuid::new_v4().to_string();
             return self
