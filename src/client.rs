@@ -1531,8 +1531,14 @@ impl Client {
         let direct_failures = interface.get_lch().read().unwrap().direct_failures;
         let mut connect_timeout = 0;
         const MIN: u64 = 1000;
-        if is_local || peer_nat_type == NatType::SYMMETRIC {
+        // What a symmetric peer is given instead of MIN: one second is barely a SYN retransmit, so
+        // the punch never got the chance the relay fallback exists to reward. The type only makes a
+        // hole unlikely, and a round that fails still falls through to the relay.
+        const SYMMETRIC_WINDOW: u64 = 4000;
+        if is_local {
             connect_timeout = MIN;
+        } else if peer_nat_type == NatType::SYMMETRIC {
+            connect_timeout = SYMMETRIC_WINDOW;
         } else {
             if relay_server.is_empty() {
                 connect_timeout = CONNECT_TIMEOUT;
@@ -1548,7 +1554,7 @@ impl Client {
                             connect_timeout = punch_time_used * 6;
                         }
                     } else if my_nat_type == NatType::SYMMETRIC as i32 {
-                        connect_timeout = MIN;
+                        connect_timeout = SYMMETRIC_WINDOW;
                     }
                 }
                 if connect_timeout == 0 {
