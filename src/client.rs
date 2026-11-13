@@ -1034,6 +1034,20 @@ impl Client {
         } else {
             transports.join("+")
         };
+        // The peer is told the address this machine reaches hbbs through, which is the wrong one
+        // as soon as it has more than one, and nothing else in the exchange tells it the rest. The
+        // port is the one the punch itself answers on: the UDP punch socket's, or - for a round
+        // that punches TCP - the rendezvous socket's, which is the port that punch reuses.
+        let punch_local_port = if udp_nat_port > 0 {
+            udp.0
+                .as_ref()
+                .and_then(|socket| socket.local_addr().ok())
+                .map(|addr| addr.port())
+        } else if allow_tcp_punch {
+            Some(my_addr.port())
+        } else {
+            None
+        };
         msg_out.set_punch_hole_request(PunchHoleRequest {
             id: peer.to_owned(),
             token: token.to_owned(),
@@ -1049,6 +1063,9 @@ impl Client {
             // pure ws), telling the controlled side its answer may gather every candidate
             // type despite force_relay instead of requiring TURN.
             webrtc_sdp_offer,
+            socket_addr_list: punch_local_port
+                .map(crate::common::punch_local_candidates)
+                .unwrap_or_default(),
             ..Default::default()
         });
         let webrtc_session_key = webrtc_offerer

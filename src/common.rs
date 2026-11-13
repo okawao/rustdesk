@@ -3120,6 +3120,108 @@ pub async fn punch_udp_verified(
         .map(|_| ())
 }
 
+/// The listener's half of a punch when the peer may answer on more than the one address the server
+/// observed. Probes go out to every one of them, and the socket stays unconnected while they do:
+/// the peer punches from one socket per address it knows, so its packets arrive from sources that
+/// cannot be predicted here, and a connected socket would hear the one leg that dialled the
+/// observed address and drop the rest.
+///
+/// Returns the source of the peer's first real packet along with it. That source is what the caller
+/// has to `connect` the socket to before handing it to KCP, and it is the one thing that is not
+/// known in advance: only the packet that follows the punch says which leg carries the session.
+///
+/// Data is only taken from a source that has already sent a punch packet, since an unconnected
+/// socket would otherwise hand the session to any host that guesses the port.
+pub async fn punch_udp_listen(
+    socket: Arc<UdpSocket>,
+    targets: &[SocketAddr],
+) -> ResultType<(SocketAddr, Option<bytes::BytesMut>)> {
+    let tid = ((hbb_common::time_based_rand() as u64) << 32) | hbb_common::time_based_rand() as u64;
+    let probe = punch_packet(&PUNCH_PROBE, tid);
+    // A peer picks the nonce, so at most one signature is made per punch.
+    let mut cached_proof: Option<Bytes> = None;
+    // Every source a punch packet has come from: what the peer's punching sockets look like here.
+    let mut sources: Vec<SocketAddr> = Vec::new();
+    let mut data = [0u8; 1500];
+    while socket.try_recv_from(&mut data).is_ok() {}
+
+    let mut retry_interval = Duration::from_millis(20);
+    const MAX_INTERVAL: Duration = Duration::from_millis(200);
+    // The same ceiling the single-address listener has always had: both ends start within one
+    // rendezvous round trip of each other, so a pair that has not answered in this long will not.
+    const MAX_TIME: Duration = Duration::from_secs(3);
+    let mut probes_sent = 0u32;
+    let mut probes_seen = 0u32;
+    let mut recv_errors = 0u32;
+    let tm = Instant::now();
+    // Absolute instants, for the same reason as in `punch_udp_inner`: a peer that keeps the
+    // receive side ready would restart a relative timer before it could ever fire.
+    let deadline = tm + MAX_TIME;
+    let mut next_probe = tm;
+
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => {
+                bail!(
+                    "UDP punch listen timed out, {probes_sent} probes sent, {probes_seen} probes received, {} peer sources, {recv_errors} recv errors absorbed",
+                    sources.len()
+                );
+            }
+            _ = tokio::time::sleep_until(next_probe) => {
+                for target in targets {
+                    socket.send_to(&probe, *target).await.ok();
+                }
+                probes_sent += 1;
+                retry_interval = std::cmp::min(retry_interval.mul_f64(1.5), MAX_INTERVAL);
+                next_probe = Instant::now() + retry_interval;
+            }
+            res = socket.recv_from(&mut data) => match res {
+                Err(e) => {
+                    recv_errors += 1;
+                    if recv_errors == 1 {
+                        log::debug!("UDP punch recv error (treated as loss): {e}");
+                    }
+                    hbb_common::sleep(0.01).await;
+                }
+                Ok((n, src)) => {
+                    if let Some(t) = punch_tid(&data[..n], &PUNCH_ACK) {
+                        // Our own probe came back: this source carries traffic both ways.
+                        if t == tid && !sources.contains(&src) {
+                            sources.push(src);
+                        }
+                    } else if let Some(peer_tid) = punch_tid(&data[..n], &PUNCH_PROBE) {
+                        probes_seen += 1;
+                        if !sources.contains(&src) {
+                            sources.push(src);
+                        }
+                        if is_punch_auth_tid(peer_tid) {
+                            if cached_proof.is_none() {
+                                cached_proof = own_punch_proof(peer_tid);
+                            }
+                            if let Some(p) = cached_proof.as_ref() {
+                                socket.send_to(p, src).await.ok();
+                            }
+                        } else {
+                            socket
+                                .send_to(&punch_packet(&PUNCH_ACK, peer_tid), src)
+                                .await
+                                .ok();
+                        }
+                    } else if punch_proof_tid(&data[..n]).is_some() {
+                        // A proof answers a marked probe, and this side never sends one.
+                    } else if n > 0 && sources.contains(&src) {
+                        log::debug!(
+                            "UDP punch listen got {n} bytes of peer data in {:?}, {probes_sent} probes sent",
+                            tm.elapsed()
+                        );
+                        return Ok((src, Some(bytes::BytesMut::from(&data[..n]))));
+                    }
+                }
+            }
+        }
+    }
+}
+
 async fn punch_udp_inner(
     socket: Arc<UdpSocket>,
     listen: bool,
@@ -4033,5 +4135,47 @@ mod tests {
         // `decode_id_pk` is the same blob minus the fingerprint, so the field is invisible to
         // non-WebRTC handshakes.
         assert_eq!(decode_id_pk(&signed, &pk).unwrap(), (id, their_pk));
+    }
+
+    // The listener punches every address the controller announced and serves the source of the
+    // peer's first real packet, which is the leg that turns out to have reached it. Nothing that
+    // has not punched first is taken for the peer, whatever it sends to the punch port.
+    #[tokio::test]
+    async fn punch_listen_serves_the_punched_source_only() {
+        const PROBE_TID: u64 = 7;
+
+        let listener = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let listener_addr = listener.local_addr().unwrap();
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        // Announced and punched, but never answered: a target that is wrong costs a probe.
+        let silent = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let strangers = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let targets = [silent.local_addr().unwrap(), peer_addr];
+        let listen = punch_udp_listen(listener, &targets);
+        let act = async {
+            hbb_common::sleep(0.05).await;
+            strangers.send_to(b"hello", listener_addr).await.unwrap();
+            let mut buf = [0u8; 64];
+            loop {
+                let (n, _) = hbb_common::timeout(2_000, peer.recv_from(&mut buf))
+                    .await
+                    .expect("the listener probes its targets")
+                    .unwrap();
+                if punch_tid(&buf[..n], &PUNCH_ACK) == Some(PROBE_TID) {
+                    break;
+                }
+                peer.send_to(&punch_packet(&PUNCH_PROBE, PROBE_TID), listener_addr)
+                    .await
+                    .unwrap();
+            }
+            peer.send_to(b"hello", listener_addr).await.unwrap();
+        };
+
+        let (result, ()) = tokio::join!(listen, act);
+        let (src, data) = result.unwrap();
+        assert_eq!(src, peer_addr, "the source that punched is the one served");
+        assert_eq!(data.as_deref(), Some(&b"hello"[..]));
     }
 }

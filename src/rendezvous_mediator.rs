@@ -1156,8 +1156,16 @@ impl RendezvousMediator {
         };
         if ph.udp_port > 0 {
             peer_addr.set_port(ph.udp_port as u16);
-            self.punch_udp_hole(peer_addr, server, msg_punch, meta, slot_udp)
-                .await?;
+            let peer_candidates = punch_candidates(&ph.socket_addr_list, peer_addr);
+            self.punch_udp_hole(
+                peer_addr,
+                peer_candidates,
+                server,
+                msg_punch,
+                meta,
+                slot_udp,
+            )
+            .await?;
             return Ok(());
         }
         if !ph.webrtc_sdp_offer.is_empty() {
@@ -1218,6 +1226,7 @@ impl RendezvousMediator {
     async fn punch_udp_hole(
         &self,
         peer_addr: SocketAddr,
+        peer_candidates: Vec<SocketAddr>,
         server: ServerPtr,
         mut msg_punch: PunchHoleSent,
         meta: ConnectionMeta,
@@ -1259,15 +1268,30 @@ impl RendezvousMediator {
                 socket.send_to(&data, addr).await.ok();
             }
         });
-        udp_nat_listen(
-            socket_cloned.clone(),
-            peer_addr,
-            peer_addr,
-            server,
-            meta,
-            slot,
-        )
-        .await?;
+        if peer_candidates.is_empty() {
+            // One address to punch, so nothing changes from the punch as it was: a connected
+            // socket, which hears the peer and nobody else.
+            udp_nat_listen(
+                socket_cloned.clone(),
+                peer_addr,
+                peer_addr,
+                server,
+                meta,
+                slot,
+            )
+            .await?;
+        } else {
+            udp_nat_listen_any(
+                socket_cloned,
+                peer_addr,
+                peer_candidates,
+                peer_addr,
+                server,
+                meta,
+                slot,
+            )
+            .await?;
+        }
         Ok(())
     }
 
@@ -1491,6 +1515,23 @@ async fn start_ipv6(
     Default::default()
 }
 
+/// The addresses a controller announced for its own punching socket, in the order it gave them:
+/// what can be punched in addition to the single address the server observed, which is the wrong
+/// one whenever that machine has more than one. A controller from before the field sends none,
+/// and the punch is then the single-address one it always was.
+fn punch_candidates(list: &[hbb_common::bytes::Bytes], primary: SocketAddr) -> Vec<SocketAddr> {
+    let mut addrs = Vec::new();
+    for addr in list.iter().map(|a| AddrMangle::decode(a)) {
+        if addr.port() > 0 && addr != primary && !addrs.contains(&addr) {
+            addrs.push(addr);
+        }
+        if addrs.len() >= crate::common::MAX_PUNCH_CANDIDATES {
+            break;
+        }
+    }
+    addrs
+}
+
 async fn udp_nat_listen(
     socket: Arc<tokio::net::UdpSocket>,
     peer_addr: SocketAddr,
@@ -1519,6 +1560,51 @@ async fn udp_nat_listen(
     func.await.map_err(|e: anyhow::Error| {
         anyhow::anyhow!(
             "Stop listening on {:?} for remote {peer_addr} with KCP, {:?} elapsed: {e}",
+            socket_cloned.local_addr(),
+            tm.elapsed()
+        )
+    })?;
+    Ok(())
+}
+
+/// `udp_nat_listen` when the controller announced more than the one address the server observed.
+///
+/// The socket stays unconnected for the punch: the controller punches from one socket per address
+/// it knows, so its packets arrive from sources this side cannot predict, and a connected socket
+/// would hear the one that dialled the observed address and drop the rest. Which of them carries
+/// the session is only known from the first real packet, and `connect` fixes it there — before
+/// KCP, whose io loop sends to the peer this socket is connected to.
+async fn udp_nat_listen_any(
+    socket: Arc<tokio::net::UdpSocket>,
+    peer_addr: SocketAddr,
+    peer_candidates: Vec<SocketAddr>,
+    peer_addr_v4: SocketAddr,
+    server: ServerPtr,
+    meta: ConnectionMeta,
+    slot: PunchSlot,
+) -> ResultType<()> {
+    let tm = Instant::now();
+    let socket_cloned = socket.clone();
+    let target_count = 1 + peer_candidates.len();
+    let func = async {
+        let mut targets = vec![peer_addr];
+        targets.extend(peer_candidates);
+        let (peer_addr, init_packet) =
+            crate::common::punch_udp_listen(socket.clone(), &targets).await?;
+        socket.connect(peer_addr).await?;
+        let stream = crate::kcp_stream::KcpStream::accept(
+            socket,
+            Duration::from_millis(CONNECT_TIMEOUT as _),
+            init_packet,
+        )
+        .await?;
+        drop(slot);
+        crate::server::create_tcp_connection(server, stream.1, peer_addr_v4, true, meta).await?;
+        Ok(())
+    };
+    func.await.map_err(|e: anyhow::Error| {
+        anyhow::anyhow!(
+            "Stop listening on {:?} for remote {peer_addr} at {target_count} addresses with KCP, {:?} elapsed: {e}",
             socket_cloned.local_addr(),
             tm.elapsed()
         )
@@ -1763,10 +1849,10 @@ impl Drop for CheckIfResendPk {
 #[cfg(test)]
 mod tests {
     use super::{
-        connection_meta, mpsc, tokio, wait_for_retry, AnswererSlot, Duration, IceRoute,
-        IntoTargetAddr, Ordering, PunchHoleSent, RendezvousMediator, RendezvousMessage,
-        CONNECT_TIMEOUT, MANUAL_RESTARTED, MANUAL_RESTART_NOTIFY, MAX_WEBRTC_ANSWERERS,
-        SHOULD_EXIT, TCP_PUNCHES, UDP_PUNCHES,
+        connection_meta, mpsc, punch_candidates, tokio, wait_for_retry, AddrMangle, AnswererSlot,
+        Duration, IceRoute, IntoTargetAddr, Ordering, PunchHoleSent, RendezvousMediator,
+        RendezvousMessage, CONNECT_TIMEOUT, MANUAL_RESTARTED, MANUAL_RESTART_NOTIFY,
+        MAX_WEBRTC_ANSWERERS, SHOULD_EXIT, TCP_PUNCHES, UDP_PUNCHES,
     };
     use hbb_common::protobuf::Message as _;
 
@@ -1826,6 +1912,7 @@ mod tests {
         mediator
             .punch_udp_hole(
                 host,
+                Vec::new(),
                 crate::server::new_for_test(),
                 msg_punch,
                 connection_meta(None, None),
@@ -1873,5 +1960,31 @@ mod tests {
         assert!(AnswererSlot::take().is_none());
         drop(held);
         assert!(AnswererSlot::take().is_some());
+    }
+
+    // The addresses the controller announced are what the punch adds, so the one the server
+    // observed is not punched twice, a repeat is not punched twice, an empty entry is nothing to
+    // punch, and the list a peer hands over is bounded.
+    #[test]
+    fn the_announced_addresses_are_punched_once_each() {
+        let primary = "10.0.0.2:21118".parse().unwrap();
+        let second = "10.0.0.3:21118".parse().unwrap();
+        let list = [primary, second, second, "0.0.0.0:0".parse().unwrap()]
+            .iter()
+            .map(|addr| hbb_common::bytes::Bytes::from(AddrMangle::encode(*addr)))
+            .collect::<Vec<_>>();
+        assert_eq!(punch_candidates(&list, primary), vec![second]);
+
+        let many = (1..=crate::common::MAX_PUNCH_CANDIDATES + 4)
+            .map(|i| {
+                hbb_common::bytes::Bytes::from(AddrMangle::encode(
+                    format!("10.0.1.{i}:21118").parse().unwrap(),
+                ))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            punch_candidates(&many, primary).len(),
+            crate::common::MAX_PUNCH_CANDIDATES
+        );
     }
 }
