@@ -1247,6 +1247,27 @@ impl RendezvousMediator {
         msg_out.set_punch_hole_sent(msg_punch);
         let data = msg_out.write_to_bytes()?;
         socket.send_to(&data, addr).await?;
+        // The datagram is what lets hbbs observe this socket's UDP mapping, and the address that
+        // observation yields is the only one a peer behind a NAT that maps per destination can be
+        // reached at. The answer to it, though, is delivered on the controller's request
+        // connection, so the whole punch rests on this one datagram arriving - and a network that
+        // filters UDP to hbbs drops it before the server ever sees it, leaving the controller to
+        // retry and fall back to the relay with nothing punched.
+        //
+        // The same message goes out over TCP as well: that transport always reaches hbbs, and the
+        // answer it produces carries the same `socket_addr_list`, so the peer is handed this
+        // machine's punching addresses even when the observed one never makes it. The datagram is
+        // still sent first and kept: on a network where it does arrive, the observed address is
+        // the better of the two, and the server hands out whichever it saw first.
+        let tcp_answer = async {
+            let mut tcp = connect_tcp(&*self.host, CONNECT_TIMEOUT).await?;
+            crate::secure_tcp_required(&mut tcp, &crate::get_key(true).await).await?;
+            tcp.send(&msg_out).await
+        }
+        .await;
+        if let Err(err) = tcp_answer {
+            log::debug!("Failed to hand the punch answer to hbbs over TCP: {err}");
+        }
         // The reply is out, and with it the answer and the v6 address: declined is the listen
         // alone, and the socket goes at once - a declined request is not worth one kept for its
         // resends, and the controller re-asks on its own. Its v4 attempt at a mapping that no
