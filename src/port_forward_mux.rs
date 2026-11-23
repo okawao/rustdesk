@@ -9,6 +9,7 @@ use hbb_common::{
     },
     ResultType,
 };
+use crate::kcp_stream::KcpStream;
 use base::message_proto::*;
 use std::sync::{Arc, Mutex};
 
@@ -474,7 +475,12 @@ mod tunnel {
             }
         }
 
-        pub fn set_muxed(&self, mut stream: Stream, interface: impl Interface) -> Arc<TunnelHandle> {
+        pub fn set_muxed(
+            &self,
+            mut stream: Stream,
+            kcp: Option<KcpStream>,
+            interface: impl Interface,
+        ) -> Arc<TunnelHandle> {
             cap_packet_size(&mut stream);
             let (data_tx, data_rx) = mpsc::channel(DATA_QUEUE_FRAMES);
             let (control_tx, control_rx) = mpsc::unbounded_channel();
@@ -492,6 +498,7 @@ mod tunnel {
             self.state.send_replace(TunnelState::Muxed(handle.clone()));
             tokio::spawn(tunnel_loop(
                 stream,
+                kcp,
                 handle.clone(),
                 data_rx,
                 control_rx,
@@ -696,6 +703,9 @@ mod tunnel {
     /// the control queue carries `window_update` alone.
     async fn tunnel_loop(
         mut stream: Stream,
+        // Keeps a punched transport's io loop running for as long as this
+        // tunnel does; a parked binding, never read.
+        _kcp: Option<KcpStream>,
         handle: Arc<TunnelHandle>,
         mut data_rx: mpsc::Receiver<Message>,
         mut control_rx: mpsc::UnboundedReceiver<Message>,
@@ -983,7 +993,7 @@ mod tests {
                 let addr = ours.peer_addr().unwrap();
                 let t = Tunnel::new();
                 t.claim();
-                let _h = t.set_muxed(Stream::Tcp(FramedStream::from(ours, addr)), NoUi::default());
+                let _h = t.set_muxed(Stream::Tcp(FramedStream::from(ours, addr)), None, NoUi::default());
                 assert!(matches!(t.claim(), Claim::Muxed(_)));
                 // The codec's three-byte header form, declaring one byte more
                 // than the cap, and nothing behind it: an uncapped codec waits
@@ -1004,7 +1014,7 @@ mod tests {
                 let (ours, mut peer) = stream_pair().await;
                 let t = Tunnel::new();
                 assert!(matches!(t.claim(), Claim::Claimed));
-                let h = t.set_muxed(ours, NoUi::default());
+                let h = t.set_muxed(ours, None, NoUi::default());
                 let (mut app, sock) = local_pair().await;
                 h.open("localhost", 80, sock, b"GET / HTTP/1.0\r\n\r\n".to_vec()).unwrap();
                 let open = recv_frame(&mut peer).await;
@@ -1036,7 +1046,7 @@ mod tests {
                 let (ours, mut peer) = stream_pair().await;
                 let t = Tunnel::new();
                 assert!(matches!(t.claim(), Claim::Claimed));
-                let h = t.set_muxed(ours, NoUi::default());
+                let h = t.set_muxed(ours, None, NoUi::default());
                 let (app, sock) = local_pair().await;
                 h.open("localhost", 80, sock, Vec::new()).unwrap();
                 let id = match recv_frame(&mut peer).await.union {
@@ -1065,7 +1075,7 @@ mod tests {
                 let t = Tunnel::new();
                 assert!(matches!(t.claim(), Claim::Claimed));
                 let ui = NoUi::default();
-                let h = t.set_muxed(ours, ui.clone());
+                let h = t.set_muxed(ours, None, ui.clone());
                 for reason in ["unreachable", "unreachable", "no permission"] {
                     let (mut app, sock) = local_pair().await;
                     h.open("localhost", 1, sock, vec![]).unwrap();
@@ -1092,7 +1102,7 @@ mod tests {
                 let (ours, mut peer) = stream_pair().await;
                 let t = Tunnel::new();
                 t.claim();
-                let h = t.set_muxed(ours, NoUi::default());
+                let h = t.set_muxed(ours, None, NoUi::default());
                 let (_app, sock) = local_pair().await;
                 h.open("localhost", 1, sock, vec![]).unwrap();
                 let id = match recv_frame(&mut peer).await.union {
@@ -1120,7 +1130,7 @@ mod tests {
                 let (ours, peer) = stream_pair().await;
                 let t = Tunnel::new();
                 t.claim();
-                let h = t.set_muxed(ours, NoUi::default());
+                let h = t.set_muxed(ours, None, NoUi::default());
                 let (mut app_a, sock_a) = local_pair().await;
                 let (mut app_b, sock_b) = local_pair().await;
                 h.open("localhost", 1, sock_a, vec![]).unwrap();
@@ -1135,7 +1145,7 @@ mod tests {
                 // The next accept establishes again on the same `Tunnel`.
                 assert!(matches!(t.claim(), Claim::Claimed));
                 let (ours, mut peer) = stream_pair().await;
-                let h = t.set_muxed(ours, NoUi::default());
+                let h = t.set_muxed(ours, None, NoUi::default());
                 let (_app_c, sock_c) = local_pair().await;
                 h.open("localhost", 1, sock_c, vec![]).unwrap();
                 assert!(matches!(
@@ -1244,7 +1254,7 @@ mod tests {
             fake_controlled(theirs, format!("127.0.0.1:{}", port));
             let t = Tunnel::new();
             t.claim();
-            let h = t.set_muxed(ours, NoUi::default());
+            let h = t.set_muxed(ours, None, NoUi::default());
             (t, h, port)
         }
 

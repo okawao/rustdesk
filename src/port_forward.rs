@@ -1,6 +1,7 @@
 use std::sync::{Arc, RwLock};
 
 use crate::client::*;
+use crate::kcp_stream::KcpStream;
 use crate::port_forward_mux::{Claim, Tunnel, CHANNEL_WINDOW};
 use hbb_common::{
     allow_err, bail,
@@ -121,9 +122,10 @@ pub async fn listen(
                 let mut forward = Framed::new(forward, BytesCodec::new());
                 let mut close_port_forward = false;
                 match connect_and_login(&id, &password, &mut ui_receiver, interface.clone(), &mut forward, key, token, is_rdp, &mut close_port_forward, &remote_host, remote_port).await {
-                    Ok(Some(stream)) => {
+                    Ok(Some((stream, kcp))) => {
                         let interface = interface.clone();
                         tokio::spawn(async move {
+                            let _kcp = kcp;
                             if let Err(err) = run_forward(forward, stream).await {
                                 interface.msgbox("error", "Error", &err.to_string(), "");
                             }
@@ -168,13 +170,13 @@ async fn connect_and_login(
     close_port_forward: &mut bool,
     remote_host: &str,
     remote_port: i32,
-) -> ResultType<Option<Stream>> {
+) -> ResultType<Option<(Stream, Option<KcpStream>)>> {
     let conn_type = if is_rdp {
         ConnType::RDP
     } else {
         ConnType::PORT_FORWARD
     };
-    let ((mut stream, direct, pk, _kcp, _stream_type), (feedback, rendezvous_server)) =
+    let ((mut stream, direct, pk, kcp, _stream_type), (feedback, rendezvous_server)) =
         Client::start(id, key, token, conn_type, interface.clone()).await?;
     let mut trust = crate::trusted_devices::client::Session::new(
         &interface.get_lch().read().unwrap(), stream.is_secured(), pk.as_deref())?;
@@ -262,7 +264,7 @@ async fn connect_and_login(
     if !buffer.is_empty() {
         allow_err!(stream.send_bytes(buffer.into()).await);
     }
-    Ok(Some(stream))
+    Ok(Some((stream, kcp)))
 }
 
 
@@ -368,7 +370,7 @@ async fn establish_tunnel(
     let mut close_port_forward = false;
     match connect_and_login_mux(id, password, ui_receiver, interface.clone(), &mut forward, key, token, is_rdp, &mut close_port_forward, remote_host, remote_port).await {
         Ok(Some(outcome)) if outcome.mux => {
-            let handle = tunnel.set_muxed(outcome.stream, interface.clone());
+            let handle = tunnel.set_muxed(outcome.stream, outcome.kcp, interface.clone());
             if !outcome.local_eof {
                 let (socket, prebuf) = take_socket(forward, outcome.prebuf);
                 if let Err(e) = handle.open(remote_host, remote_port, socket, prebuf) {
@@ -421,7 +423,7 @@ async fn connect_and_login_mux(
     } else {
         ConnType::PORT_FORWARD
     };
-    let ((mut stream, direct, pk, _kcp, _stream_type), (feedback, rendezvous_server)) =
+    let ((mut stream, direct, pk, kcp, _stream_type), (feedback, rendezvous_server)) =
         Client::start(id, key, token, conn_type, interface.clone()).await?;
     let mut trust = crate::trusted_devices::client::Session::new(
         &interface.get_lch().read().unwrap(), stream.is_secured(), pk.as_deref())?;
@@ -513,6 +515,7 @@ async fn connect_and_login_mux(
     }
     Ok(Some(LoginOutcome {
         stream,
+        kcp,
         mux,
         prebuf: buffer,
         local_eof,
@@ -527,8 +530,10 @@ fn run_legacy(
     interface: impl Interface,
 ) {
     let mut stream = outcome.stream;
+    let _kcp = outcome.kcp;
     let prebuf = outcome.prebuf;
     tokio::spawn(async move {
+        let _kcp = _kcp;
         stream.set_raw();
         if !prebuf.is_empty() {
             allow_err!(stream.send_bytes(prebuf.into()).await);
@@ -542,6 +547,10 @@ fn run_legacy(
 
 struct LoginOutcome {
     stream: Stream,
+    /// The KCP handle that keeps a punched transport's io loop running. Dropped
+    /// with the stream it belongs to, never before: without it the loop stops
+    /// as soon as the login returns and the tunnel opens on a dead sink.
+    kcp: Option<KcpStream>,
     mux: bool,
     prebuf: Vec<u8>,
     local_eof: bool,
