@@ -3222,6 +3222,188 @@ pub async fn punch_udp_listen(
     }
 }
 
+/// The connector's half of a punch when the address it must reach is not the one the server
+/// observed for it.
+///
+/// Same round trip as `punch_udp_inner` - it returns once its own probe has been acknowledged -
+/// but the socket stays unconnected for the punch and probes every address the peer announced.
+/// A connected socket hears only the leg that dialled the one address it was connected to, which
+/// on a NAT that maps per destination is exactly the leg that has no mapping: the peer's answer
+/// arrives at the mapping this socket made towards the peer, on the port the peer was never told.
+/// Unconnected, that answer is heard, and the source that sent it is what the socket is connected
+/// to afterwards.
+///
+/// The peer's own probe is taken as proof of the same round trip from the other side: the mapping
+/// it arrived from is the one our answer goes back to, so the session can start on it without
+/// waiting for the observed address to answer at all. That is what carries a punch to a peer on a
+/// LAN or a VPN, where the address hbbs sees is the only one that cannot be used.
+pub async fn punch_udp_scan(
+    socket: Arc<UdpSocket>,
+    targets: &[SocketAddr],
+    verify: Option<&sign::PublicKey>,
+) -> ResultType<SocketAddr> {
+    let tid = ((hbb_common::time_based_rand() as u64) << 32) | hbb_common::time_based_rand() as u64;
+    let probe = punch_packet(&PUNCH_PROBE, tid);
+    // The marked probe rides out with the plain one, so its answer comes back on a round trip the
+    // punch was spending anyway instead of on one of its own.
+    let auth_tid = verify.map(|_| punch_auth_tid());
+    let auth_probe = auth_tid.map(|t| punch_packet(&PUNCH_PROBE, t));
+    let mut proved = false;
+    // Set when the peer echoed the marked probe unsigned, which is what a build from before the
+    // proof does - there is nothing further to wait for.
+    let mut predates_proof = false;
+    // A peer picks the nonce, so at most one signature is made per punch.
+    let mut cached_proof: Option<Bytes> = None;
+    // The first source that acknowledged our probe, held until the proof it owes arrives.
+    let mut acked: Option<SocketAddr> = None;
+    const PROOF_GRACE: Duration = Duration::from_millis(150);
+    const PROOF_IDLE: Duration = Duration::from_secs(3600);
+    let mut proof_deadline = Instant::now() + PROOF_IDLE;
+    let mut data = [0u8; 1500];
+    while socket.try_recv_from(&mut data).is_ok() {}
+
+    let mut retry_interval = Duration::from_millis(20);
+    const MAX_INTERVAL: Duration = Duration::from_millis(200);
+    const MAX_TIME: Duration = Duration::from_secs(3);
+    let mut probes_sent = 0u32;
+    let mut probes_seen = 0u32;
+    let mut recv_errors = 0u32;
+    let tm = Instant::now();
+    // Absolute instants, as in `punch_udp_inner`: a peer that keeps the receive side ready would
+    // restart a relative timer before it could ever fire.
+    let deadline = tm + MAX_TIME;
+    // The first round goes out before anything is listened for, as it does in `punch_udp_inner`:
+    // the peer marks the source it hears from, and that mark is what lets the session it opens
+    // across this punch through the filter `punch_udp_listen` keeps.
+    for target in targets {
+        socket.send_to(&probe, *target).await.ok();
+        if let Some(p) = auth_probe.as_ref() {
+            socket.send_to(p, *target).await.ok();
+        }
+    }
+    probes_sent += 1;
+    let mut next_probe = tm + retry_interval;
+
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => {
+                if let Some(src) = acked {
+                    log::debug!(
+                        "UDP punch scan confirmed without an identity proof in {:?}, {probes_sent} probes sent, {probes_seen} probes received",
+                        tm.elapsed()
+                    );
+                    return Ok(src);
+                }
+                bail!("UDP punch scan timed out, {probes_sent} probes sent, {probes_seen} probes received");
+            }
+            _ = tokio::time::sleep_until(proof_deadline) => {
+                proof_deadline = Instant::now() + PROOF_IDLE;
+                if let Some(src) = acked {
+                    log::debug!(
+                        "UDP punch scan confirmed without an identity proof in {:?}",
+                        tm.elapsed()
+                    );
+                    return Ok(src);
+                }
+            }
+            _ = tokio::time::sleep_until(next_probe) => {
+                for target in targets {
+                    socket.send_to(&probe, *target).await.ok();
+                    if let Some(p) = auth_probe.as_ref() {
+                        socket.send_to(p, *target).await.ok();
+                    }
+                }
+                probes_sent += 1;
+                retry_interval = std::cmp::min(retry_interval.mul_f64(1.5), MAX_INTERVAL);
+                next_probe = Instant::now() + retry_interval;
+            }
+            res = socket.recv_from(&mut data) => match res {
+                Err(e) => {
+                    // ICMP unreachable from a NAT is expected while the hole forms and surfaces
+                    // here as ConnectionReset/Refused; treat it as loss, MAX_TIME bounds the
+                    // attempt. Log only the first - this retries every 10ms.
+                    recv_errors += 1;
+                    if recv_errors == 1 {
+                        log::debug!("UDP punch scan recv error (treated as loss): {e}");
+                    }
+                    hbb_common::sleep(0.01).await;
+                }
+                Ok((n, src)) => {
+                    if let Some(t) = punch_tid(&data[..n], &PUNCH_ACK) {
+                        if t == tid {
+                            if verify.is_none() || proved || predates_proof {
+                                log::debug!(
+                                    "UDP punch scan confirmed by {src} in {:?}, {probes_sent} probes sent, {probes_seen} received, proved: {proved}",
+                                    tm.elapsed()
+                                );
+                                return Ok(src);
+                            }
+                            if acked.is_none() {
+                                acked = Some(src);
+                                proof_deadline = Instant::now() + PROOF_GRACE;
+                            }
+                        } else if Some(t) == auth_tid {
+                            predates_proof = true;
+                            if let Some(src) = acked {
+                                log::debug!(
+                                    "UDP punch scan confirmed by {src} in {:?}, peer predates the identity proof",
+                                    tm.elapsed()
+                                );
+                                return Ok(src);
+                            }
+                        }
+                    } else if let Some(t) = punch_proof_tid(&data[..n]) {
+                        // A proof carrying another nonce is a straggler from an earlier attempt
+                        // on this socket, and says nothing about this one.
+                        if let (Some(pk), Some(expected)) = (verify, auth_tid) {
+                            if t == expected {
+                                if punch_proof_matches(&data[..n], t, pk) {
+                                    log::debug!(
+                                        "UDP punch scan peer proved its identity in {:?}",
+                                        tm.elapsed()
+                                    );
+                                    proved = true;
+                                    if let Some(src) = acked {
+                                        return Ok(src);
+                                    }
+                                } else {
+                                    // A host that answers the marked probe but signs it with
+                                    // another key is not the peer: wrong address, or a shared one.
+                                    bail!("UDP punch answered by a host that is not the peer");
+                                }
+                            }
+                        }
+                    } else if let Some(peer_tid) = punch_tid(&data[..n], &PUNCH_PROBE) {
+                        probes_seen += 1;
+                        if is_punch_auth_tid(peer_tid) {
+                            if cached_proof.is_none() {
+                                cached_proof = own_punch_proof(peer_tid);
+                            }
+                            if let Some(p) = cached_proof.as_ref() {
+                                socket.send_to(p, src).await.ok();
+                            }
+                        } else {
+                            socket
+                                .send_to(&punch_packet(&PUNCH_ACK, peer_tid), src)
+                                .await
+                                .ok();
+                        }
+                        // The peer's probe is the path proven from the other side: it reached
+                        // this socket, so the mapping it arrived from is the one our answer goes
+                        // back to. The session can start there without the observed address ever
+                        // answering - which, behind a NAT that maps per destination, it will not.
+                        log::debug!(
+                            "UDP punch scan answered by probing peer {src} in {:?}, {probes_sent} probes sent",
+                            tm.elapsed()
+                        );
+                        return Ok(src);
+                    }
+                }
+            }
+        }
+    }
+}
+
 async fn punch_udp_inner(
     socket: Arc<UdpSocket>,
     listen: bool,

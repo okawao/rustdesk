@@ -396,9 +396,6 @@ fn tcp_punch_allowed() -> bool {
 struct PunchExtra {
     candidates: Vec<SocketAddr>,
     verify: Option<sign::PublicKey>,
-    /// Whether the announced addresses belong to a UDP punch socket, dialled with probes, or to the
-    /// TCP punch's listener, dialled with a SYN.
-    udp: bool,
 }
 
 impl PunchExtra {
@@ -417,7 +414,6 @@ impl PunchExtra {
         Self {
             candidates,
             verify: None,
-            udp: ph.is_udp,
         }
     }
 
@@ -568,7 +564,13 @@ impl Client {
         // Shared state for UDP NAT test result
         if crate::get_udp_punch_enabled() && !interface.is_force_relay() {
             if let Ok((socket, addr)) = new_direct_udp_for_unverified(&rendezvous_server).await {
-                let udp_port = Arc::new(Mutex::new(0));
+                // The port the punch answers on, not the one the server would observe: a punch
+                // that reaches the peer over a LAN or a VPN never has its mapping observed for
+                // the path that carries it, and the round has to exist all the same. The test
+                // below overwrites this with the observed port when the server answers, which
+                // is the one the observed address needs; its failure must not cost the round.
+                let local_port = socket.local_addr().map(|a| a.port()).unwrap_or(0);
+                let udp_port = Arc::new(Mutex::new(local_port));
                 let up_cloned = udp_port.clone();
                 let socket_cloned = socket.clone();
                 let func = async move {
@@ -881,7 +883,7 @@ impl Client {
         token: String,
         conn_type: ConnType,
         interface: impl Interface,
-        mut udp: (Option<Arc<UdpSocket>>, Option<Arc<Mutex<u16>>>),
+        udp: (Option<Arc<UdpSocket>>, Option<Arc<Mutex<u16>>>),
         stop_udp_tx: Option<oneshot::Sender<()>>,
         mut ipv6: Option<(Arc<UdpSocket>, bytes::Bytes)>,
         webrtc_offerer: Option<WebRTCStream>,
@@ -1137,13 +1139,11 @@ impl Client {
                                 verify: crate::common::punch_verify_key(&signed_id_pk, &key),
                                 ..punch_candidates
                             };
-                            let s = udp.0.take();
-                            if udp_nat_port > 0 && ph.is_udp && s.is_some() {
-                                if let Some(s) = s {
-                                    allow_err!(s.connect(peer_addr).await);
-                                    udp.0 = Some(s);
-                                }
-                            }
+                            // The UDP punch socket is deliberately left unconnected: on a NAT
+                            // that maps per destination, the address the server observed for it
+                            // is the one address the peer cannot reach it at, and the answer that
+                            // opens the hole arrives from the mapping the punch made towards the
+                            // peer. A connected socket would filter that answer out as foreign.
                             let s = ipv6.0.take();
                             if !ph.socket_addr_v6.is_empty() && s.is_some() {
                                 let addr = AddrMangle::decode(&ph.socket_addr_v6);
@@ -1590,12 +1590,11 @@ impl Client {
         if allow_tcp_punch {
             // Every address the peer announced is dialled at once, not one after another: the peer
             // listens on all of them, so they are independent connects, and a wrong one then costs
-            // nothing but the socket it holds until another answers.
-            let candidates = if punch_extra.udp {
-                vec![peer]
-            } else {
-                punch_extra.punch_order(peer)
-            };
+            // nothing but the socket it holds until another answers. That holds whatever form the
+            // peer's punch took - an address it does not answer on costs one SYN, and the announced
+            // list is the only place the addresses that carry a punch through a LAN or a VPN appear
+            // at all.
+            let candidates = punch_extra.punch_order(peer);
             direct_futures.push(
                 async move {
                     let mut legs = Vec::with_capacity(candidates.len());
@@ -1626,32 +1625,25 @@ impl Client {
             // The verified punch rides along with the first candidate: it costs no extra round
             // trip, and it is what makes a wrong address cheap to give up on there.
             let verify = punch_extra.verify;
-            let candidates = if punch_extra.udp {
-                punch_extra.punch_order(peer)
-            } else {
-                vec![peer]
-            };
+            // Every address the peer announced is punched, not only when it announced a UDP
+            // punch: a port the peer does not answer on costs one probe, and the list is the only
+            // place the addresses that carry a punch through a LAN or a VPN appear at all. The
+            // observed address stays first, which is the order the punch has always had.
+            let candidates = punch_extra.punch_order(peer);
             direct_futures.push(
                 async move {
-                    let mut legs = Vec::with_capacity(candidates.len());
-                    for addr in candidates {
-                        // One socket per address, all probing at once: a connected UDP socket
-                        // carries a single peer, and the punch's own is the one whose port the
-                        // peer was told. An announced address gets its own, left on the wildcard
-                        // so the route picks the source - the only way a peer reached through a
-                        // tunnel sees one it can answer.
-                        let socket = if addr == peer {
-                            udp_socket_nat.clone()
-                        } else {
-                            match new_udp_punch_socket(addr).await {
-                                Ok(socket) => socket,
-                                Err(err) => {
-                                    log::debug!("No UDP punch socket for {addr}: {err}");
-                                    continue;
-                                }
+                    let mut legs = Vec::with_capacity(candidates.len() + 1);
+                    for addr in candidates.iter().copied().filter(|addr| *addr != peer) {
+                        // One connected socket per announced address: the peer dialled it the same
+                        // way, so the usual connected punch is what proves it.
+                        let socket = match new_udp_punch_socket(addr).await {
+                            Ok(socket) => socket,
+                            Err(err) => {
+                                log::debug!("No UDP punch socket for {addr}: {err}");
+                                continue;
                             }
                         };
-                        if addr != peer && socket.connect(addr).await.is_err() {
+                        if socket.connect(addr).await.is_err() {
                             continue;
                         }
                         legs.push(
@@ -1663,6 +1655,27 @@ impl Client {
                             .boxed(),
                         );
                     }
+                    // The punch's own socket: the one whose port the peer was told, and on a NAT
+                    // that maps per destination the one the peer's answer cannot reach. It probes
+                    // every address the peer announced from one unconnected socket, hears the
+                    // answer wherever it arrives, and connects there.
+                    let mut targets = Vec::with_capacity(candidates.len() + 1);
+                    targets.push(peer);
+                    targets.extend(candidates.iter().copied().filter(|addr| *addr != peer));
+                    legs.push(
+                        async move {
+                            let res = udp_nat_scan_connect(
+                                udp_socket_nat,
+                                &targets,
+                                "UDP",
+                                connect_timeout,
+                                verify,
+                            )
+                            .await?;
+                            Ok((res.0, res.1, res.2, true))
+                        }
+                        .boxed(),
+                    );
                     select_ok(legs).await.map(|x| x.0)
                 }
                 .boxed(),
@@ -5771,6 +5784,35 @@ async fn udp_nat_connect(
             log::debug!("{err}");
             anyhow!(err)
         })?;
+    let res = KcpStream::connect(socket, Duration::from_millis(ms_timeout))
+        .await
+        .map_err(|err| {
+            log::debug!("Failed to connect KCP stream: {}", err);
+            anyhow!(err)
+        })?;
+    Ok((res.1, Some(res.0), typ))
+}
+
+/// `udp_nat_connect` for the punch's own socket when the peer's answer may arrive from any of the
+/// addresses it announced. The socket is unconnected for the punch, so the source that proves the
+/// round trip is what it is connected to before KCP takes it over.
+async fn udp_nat_scan_connect(
+    socket: Arc<UdpSocket>,
+    targets: &[SocketAddr],
+    typ: &'static str,
+    ms_timeout: u64,
+    verify: Option<sign::PublicKey>,
+) -> ResultType<(Stream, Option<KcpStream>, &'static str)> {
+    let src = crate::common::punch_udp_scan(socket.clone(), targets, verify.as_ref())
+        .await
+        .map_err(|err| {
+            log::debug!("{err}");
+            anyhow!(err)
+        })?;
+    socket.connect(src).await.map_err(|err| {
+        log::debug!("Failed to connect the punched socket to {src}: {err}");
+        anyhow!(err)
+    })?;
     let res = KcpStream::connect(socket, Duration::from_millis(ms_timeout))
         .await
         .map_err(|err| {
